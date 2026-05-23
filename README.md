@@ -224,6 +224,20 @@ files → normalizer (FSM)
 
 Crates: `core`, `lang-config`, `normalizer`, `slicer`, `fingerprinter`, `index`, `verifier`, `classifier`, `engine` (orchestrator), `cli`, `lsp-server`, `semantic` (stretch, milestone 8).
 
+## Accuracy testing
+
+Two layers:
+
+1. **Hand-crafted fixtures** under `tests/fixtures/copy-paste*` plant known Type-1/2 clones in small Python files. The default `cargo test` suite asserts the engine surfaces those plants as the top finding under both naive and LSH backends, and that function-mode beats file-mode on function-level clones.
+2. **Real-world corpus** — `scripts/fetch-corpora.sh` clones known-dirty repos (TheAlgorithms/Python, Salt, Hadoop, WordPress) into `tests/corpora/`. An opt-in integration test in `crates/cli/tests/end_to_end_real_corpus.rs` points the engine at TheAlgorithms/Python and asserts (a) finding-volume floors, (b) the presence of specific clones humans have flagged before in that repo (`extended_gcd` shared between `modular_division.py` and `diophantine_equation.py`, `binary_search_by_recursion` shared between `binary_search.py` and `exponential_search.py`, etc.), and (c) the cross-module classifier tag firing. Run it with:
+
+   ```sh
+   scripts/fetch-corpora.sh the-algorithms-python
+   cargo test --release -p tokei-dedup-cli -- --ignored real_corpus
+   ```
+
+   On commit `456d644c23` of TheAlgorithms/Python: 1,485 files scanned in ~0.25s, 2,010 findings at j ≥ 0.7, all four asserted known-clone pairs present.
+
 ## Status
 
 | # | Milestone | State |
