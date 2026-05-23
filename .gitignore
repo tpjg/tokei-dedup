@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.idea
+.vscode
+*.swp
+*.swo
+.DS_Store
+
+# Downloaded test corpora (fetched on demand)
+/tests/corpora/

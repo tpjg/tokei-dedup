@@ -1,0 +1,14 @@
+[package]
+name = "tokei-dedup-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "tokei-dedup CLI binary (stub — see DESIGN.md)"
+
+[[bin]]
+name = "dupe"
+path = "src/main.rs"
+
+[dependencies]
