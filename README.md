@@ -21,6 +21,20 @@ See [`DESIGN.md`](./DESIGN.md) for the long version.
 
 ## Install
 
+Prebuilt binaries for Linux (x86_64 gnu/musl, aarch64 gnu) and macOS (x86_64, aarch64) are published on every `v*` tag.
+
+```sh
+curl -fsSL https://github.com/tpjg/tokei-dedup/releases/latest/download/install.sh | sh
+```
+
+The script detects your OS/arch, downloads the matching tarball, verifies its SHA256, and installs `dupe` + `dupe-lsp` into `$HOME/.local/bin`. Override with `BIN_DIR=/usr/local/bin sh` or pin a version with `VERSION=v0.1.0 sh`.
+
+### Manual download
+
+If you'd rather not curl-pipe, grab the tarball straight from the [releases page](https://github.com/tpjg/tokei-dedup/releases) — e.g. `tokei-dedup-x86_64-unknown-linux-gnu.tar.gz` — and extract the two binaries.
+
+### Build from source
+
 Requires a stable Rust toolchain.
 
 ```sh
@@ -29,6 +43,8 @@ cd tokei-dedup
 cargo build --release
 # Produces ./target/release/dupe and ./target/release/dupe-lsp
 ```
+
+> A `cargo install tokei-dedup-cli` path is not wired up yet; the crates aren't published to crates.io.
 
 ## CLI: `dupe scan`
 

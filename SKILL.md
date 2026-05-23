@@ -2,16 +2,18 @@
 
 Use when the user asks to find duplicate / cloned / copy-pasted code in a directory.
 
-## Build (once)
+## Install (once)
 
 ```sh
-cargo build --release
+curl -fsSL https://github.com/tpjg/tokei-dedup/releases/latest/download/install.sh | sh
 ```
+
+Drops `dupe` and `dupe-lsp` into `$HOME/.local/bin` (override with `BIN_DIR=...`).
 
 ## Run
 
 ```sh
-./target/release/dupe scan <DIR> --granularity function --blind aggressive --min-jaccard 0.6 --top 50 --json
+dupe scan <DIR> --granularity function --blind aggressive --min-jaccard 0.6 --top 50 --json
 ```
 
 Output: JSON to stdout. Parse `.findings` (array, score-sorted descending).

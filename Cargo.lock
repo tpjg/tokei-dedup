@@ -1625,14 +1625,14 @@ dependencies = [
 
 [[package]]
 name = "tokei-dedup-classifier"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "tokei-dedup-verifier",
 ]
 
 [[package]]
 name = "tokei-dedup-cli"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap 4.6.1",
@@ -1650,14 +1650,14 @@ dependencies = [
 
 [[package]]
 name = "tokei-dedup-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "tokei-dedup-engine"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "ignore",
  "rayon",
@@ -1675,7 +1675,7 @@ dependencies = [
 
 [[package]]
 name = "tokei-dedup-fingerprinter"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "tokei-dedup-core",
  "xxhash-rust",
@@ -1683,7 +1683,7 @@ dependencies = [
 
 [[package]]
 name = "tokei-dedup-index"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "tokei-dedup-fingerprinter",
  "xxhash-rust",
@@ -1691,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "tokei-dedup-lang-config"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "once_cell",
  "serde",
@@ -1700,7 +1700,7 @@ dependencies = [
 
 [[package]]
 name = "tokei-dedup-lsp-server"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "tokei-dedup-classifier",
  "tokei-dedup-engine",
@@ -1710,7 +1710,7 @@ dependencies = [
 
 [[package]]
 name = "tokei-dedup-normalizer"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "tokei",
  "tokei-dedup-core",
@@ -1719,11 +1719,11 @@ dependencies = [
 
 [[package]]
 name = "tokei-dedup-semantic"
-version = "0.0.1"
+version = "0.1.0"
 
 [[package]]
 name = "tokei-dedup-slicer"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "streaming-iterator",
  "tree-sitter",
@@ -1742,7 +1742,7 @@ dependencies = [
 
 [[package]]
 name = "tokei-dedup-verifier"
-version = "0.0.1"
+version = "0.1.0"
 
 [[package]]
 name = "tokio"
