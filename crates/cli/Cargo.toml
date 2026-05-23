@@ -5,10 +5,27 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "tokei-dedup CLI binary (stub — see DESIGN.md)"
+description = "tokei-dedup `dupe` CLI"
 
 [[bin]]
 name = "dupe"
 path = "src/main.rs"
 
 [dependencies]
+tokei-dedup-core = { workspace = true }
+tokei-dedup-lang-config = { workspace = true }
+tokei-dedup-normalizer = { workspace = true }
+tokei-dedup-fingerprinter = { workspace = true }
+tokei-dedup-index = { workspace = true }
+clap = { workspace = true }
+walkdir = { workspace = true }
+rayon = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokei-dedup-core = { workspace = true }
+tokei-dedup-lang-config = { workspace = true }
+tokei-dedup-normalizer = { workspace = true }
+tokei-dedup-fingerprinter = { workspace = true }
+tokei-dedup-index = { workspace = true }
+walkdir = { workspace = true }
