@@ -1,0 +1,16 @@
+[package]
+name = "tokei-dedup-normalizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Single-pass FSM that normalizes source code into a token stream, driven by tokei language definitions"
+
+[dependencies]
+tokei-dedup-core = { workspace = true }
+tokei-dedup-lang-config = { workspace = true }
+
+[dev-dependencies]
+# Cross-validation oracle: tokei itself.
+tokei = "12"
