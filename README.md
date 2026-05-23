@@ -65,6 +65,19 @@ dupe scan src/ --granularity function --json
 | `--use-naive` | off | Fall back to the exact all-pairs index (slow on > 5k files; useful as an oracle) |
 | `--k <N>` / `--window <N>` | `5`/`4` | MOSS winnowing parameters |
 | `--only-lang <KEY>` | all | Restrict to one tokei language key (e.g. `Rust`, `Python`) |
+| `--exclude <PATTERN>` | — | Skip gitignore-style pattern (repeatable). E.g. `--exclude target --exclude '**/test_data/**'` |
+| `--no-gitignore` | off | Don't read `.gitignore` / `.ignore` files or skip hidden files |
+| `--no-default-excludes` | off | Don't apply the built-in exclude list below |
+
+### What gets skipped by default
+
+The walker uses ripgrep's `ignore` crate, composing three layers (all on by default):
+
+1. **`.gitignore` / `.ignore` / `.git/info/exclude`** plus the user-global gitignore. Hidden files (`.foo`) are also skipped. Disable with `--no-gitignore`.
+2. **Built-in directory blocklist** — matched as gitignore-style names at any depth: `.git`, `.svn`, `.hg`, `node_modules`, `bower_components`, `.next`, `.nuxt`, `target`, `dist`, `build`, `out`, `bin`, `obj`, `coverage`, `vendor`, `.venv`, `venv`, `__pycache__`, `.tox`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.idea`, `.vscode`. Disable with `--no-default-excludes`.
+3. **Custom `--exclude PATTERN`** — gitignore-style globs (`target`, `**/test_data/**`, `*.generated.*`). Repeat the flag.
+
+This means `dupe scan .` in a real project does the right thing without any boilerplate — build outputs, dependency dirs, and virtualenvs are gone. If you actually want to scan them, pass `--no-default-excludes --no-gitignore`.
 
 ### Output
 

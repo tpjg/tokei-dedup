@@ -10,6 +10,7 @@
 //!    relative to `workspace`.
 //! 5. Return a [`ScanResult`] with the findings plus diagnostic stats.
 
+use ignore::{overrides::OverrideBuilder, WalkBuilder};
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -24,7 +25,6 @@ use tokei_dedup_lang_config as lang_config;
 use tokei_dedup_normalizer::Normalizer;
 use tokei_dedup_slicer::Slicer;
 use tokei_dedup_verifier::{verify, Verified};
-use walkdir::WalkDir;
 
 pub use tokei_dedup_classifier::{Finding as ClassifiedFinding, ItemRef as FindingEndpoint, Tag};
 pub use tokei_dedup_core::BlindMode as BlindModeExt;
@@ -35,6 +35,70 @@ pub enum Granularity {
     Function,
 }
 
+/// Built-in directory/file names skipped at every depth when
+/// [`WalkOptions::apply_default_excludes`] is set. Tries to cover the common cases that
+/// projects don't always remember to gitignore (build outputs, dependency dirs, virtual
+/// environments, editor metadata). Pure name match, no globs — `node_modules/foo.js` is
+/// skipped but `my-node_modules/foo.js` is not.
+pub const DEFAULT_EXCLUDES: &[&str] = &[
+    // VCS
+    ".git",
+    ".svn",
+    ".hg",
+    // JS / Node
+    "node_modules",
+    "bower_components",
+    ".next",
+    ".nuxt",
+    // Rust
+    "target",
+    // Generic build outputs
+    "dist",
+    "build",
+    "out",
+    "bin",
+    "obj",
+    "coverage",
+    // Go / PHP
+    "vendor",
+    // Python
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".tox",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    // Editor metadata
+    ".idea",
+    ".vscode",
+];
+
+/// Walker filtering options. All three layers compose — gitignore + default-excludes +
+/// custom patterns. Disable any with the respective flag.
+#[derive(Debug, Clone)]
+pub struct WalkOptions {
+    /// Honor `.gitignore`, `.ignore`, `.git/info/exclude`, and the user-global gitignore.
+    /// Also filters hidden files (`.foo`). Equivalent to `WalkBuilder::standard_filters`.
+    pub respect_gitignore: bool,
+    /// Apply [`DEFAULT_EXCLUDES`] at every depth.
+    pub apply_default_excludes: bool,
+    /// Extra gitignore-style patterns to skip. Each entry may be a literal name (`target`)
+    /// or a glob (`**/test_data/**`). A leading `!` is accepted but ignored — these are
+    /// always exclude patterns from the caller's perspective.
+    pub custom_excludes: Vec<String>,
+}
+
+impl Default for WalkOptions {
+    fn default() -> Self {
+        Self {
+            respect_gitignore: true,
+            apply_default_excludes: true,
+            custom_excludes: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
     pub blind: BlindMode,
@@ -42,14 +106,11 @@ pub struct ScanOptions {
     pub k: usize,
     pub window: usize,
     pub use_naive: bool,
-    /// LSH mode: minimum exact Jaccard to retain.
     pub min_jaccard: f32,
-    /// Naive mode: minimum shared distinct fingerprints.
     pub min_shared: u32,
-    /// Naive mode: drop fingerprint buckets above this size.
     pub max_bucket: usize,
-    /// Restrict to a single tokei language key, e.g. `"Rust"`.
     pub only_lang: Option<String>,
+    pub walk: WalkOptions,
 }
 
 impl Default for ScanOptions {
@@ -64,6 +125,7 @@ impl Default for ScanOptions {
             min_shared: 10,
             max_bucket: 50,
             only_lang: None,
+            walk: WalkOptions::default(),
         }
     }
 }
@@ -85,12 +147,7 @@ pub fn scan(workspace: &Path, opts: &ScanOptions) -> ScanResult {
     let slicer = Slicer::new();
     let start = Instant::now();
 
-    let paths: Vec<PathBuf> = WalkDir::new(workspace)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.into_path())
-        .collect();
+    let paths: Vec<PathBuf> = walk_filtered(workspace, &opts.walk);
     let files_walked = paths.len();
 
     let items: Vec<Item> = paths
@@ -144,6 +201,52 @@ struct Item {
     sketch: Sketch,
     unique_fps: u32,
     unique_set: HashSet<u64>,
+}
+
+/// Walk `workspace` honoring the three-layer ignore rules:
+///
+/// 1. `WalkBuilder::standard_filters(respect_gitignore)` — `.gitignore`, `.ignore`,
+///    `.git/info/exclude`, the user-global gitignore, and hidden-file filtering.
+/// 2. [`DEFAULT_EXCLUDES`] as gitignore-style overrides when `apply_default_excludes`.
+/// 3. User patterns from `custom_excludes`, prefixed with `!` so they're treated as
+///    excludes by `OverrideBuilder`.
+///
+/// `OverrideBuilder` reads `!pat` as "blacklist," and when *every* override is a
+/// blacklist (the case here) non-matching paths are included normally.
+pub fn walk_filtered(workspace: &Path, opts: &WalkOptions) -> Vec<PathBuf> {
+    let mut builder = WalkBuilder::new(workspace);
+    builder.standard_filters(opts.respect_gitignore);
+
+    let mut ob = OverrideBuilder::new(workspace);
+    let mut any_pattern = false;
+    if opts.apply_default_excludes {
+        for &name in DEFAULT_EXCLUDES {
+            if ob.add(&format!("!{name}")).is_ok() {
+                any_pattern = true;
+            }
+        }
+    }
+    for pat in &opts.custom_excludes {
+        let trimmed = pat.trim_start_matches('!').trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if ob.add(&format!("!{trimmed}")).is_ok() {
+            any_pattern = true;
+        }
+    }
+    if any_pattern {
+        if let Ok(overrides) = ob.build() {
+            builder.overrides(overrides);
+        }
+    }
+
+    builder
+        .build()
+        .filter_map(|r| r.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| e.into_path())
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -354,6 +457,7 @@ fn same_endpoint(a: &ItemRef, b: &ItemRef) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn scan_options_default_is_sensible() {
@@ -361,5 +465,101 @@ mod tests {
         assert_eq!(o.granularity, Granularity::File);
         assert!(!o.use_naive);
         assert!(o.min_jaccard > 0.0 && o.min_jaccard < 1.0);
+        assert!(o.walk.respect_gitignore);
+        assert!(o.walk.apply_default_excludes);
+    }
+
+    /// Build a temp dir with `src/main.rs` plus a few common-build-dir noise files.
+    /// Returns the dir handle (drop to clean up) and its path.
+    fn temp_project_with_build_noise() -> (tempdir::TempDir, PathBuf) {
+        let dir = tempdir::TempDir::new("tokei-dedup-walk").unwrap();
+        let root = dir.path().to_owned();
+        let make = |rel: &str, content: &str| {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, content).unwrap();
+        };
+        make("src/main.rs", "fn main() {}\n");
+        make("src/lib.rs", "pub fn x() {}\n");
+        make("target/debug/build/foo.rs", "// build artifact\n");
+        make("node_modules/foo/index.js", "module.exports = {};\n");
+        make("dist/bundle.js", "console.log('built');\n");
+        make("vendor/lib.go", "package vendored\n");
+        make(".venv/lib/site.py", "# venv\n");
+        (dir, root)
+    }
+
+    #[test]
+    fn default_excludes_skip_build_dirs() {
+        let (_dir, root) = temp_project_with_build_noise();
+        let paths = walk_filtered(&root, &WalkOptions::default());
+        let names: Vec<String> = paths
+            .iter()
+            .filter_map(|p| p.strip_prefix(&root).ok())
+            .map(|p| p.display().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n.ends_with("main.rs")));
+        assert!(names.iter().any(|n| n.ends_with("lib.rs")));
+        // All the build/dependency dirs must be absent.
+        for noisy in &["target", "node_modules", "dist", "vendor", ".venv"] {
+            assert!(
+                !names.iter().any(|n| n.contains(noisy)),
+                "expected {noisy} to be excluded, got files: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabling_default_excludes_lets_build_dirs_through() {
+        let (_dir, root) = temp_project_with_build_noise();
+        let opts = WalkOptions {
+            respect_gitignore: false,
+            apply_default_excludes: false,
+            custom_excludes: vec![],
+        };
+        let paths = walk_filtered(&root, &opts);
+        // With everything off we see every file we created.
+        assert!(paths.len() >= 6);
+    }
+
+    #[test]
+    fn custom_excludes_skip_user_patterns() {
+        let (_dir, root) = temp_project_with_build_noise();
+        // Disable defaults; rely on a single custom pattern.
+        let opts = WalkOptions {
+            respect_gitignore: false,
+            apply_default_excludes: false,
+            custom_excludes: vec!["target".into()],
+        };
+        let paths = walk_filtered(&root, &opts);
+        assert!(paths.iter().any(|p| p.ends_with("main.rs")));
+        assert!(
+            !paths.iter().any(|p| p.components().any(|c| c.as_os_str() == "target")),
+            "custom_excludes should drop target/"
+        );
+    }
+
+    #[test]
+    fn gitignore_layer_is_honored() {
+        let (_dir, root) = temp_project_with_build_noise();
+        // The `ignore` crate only reads .gitignore when the directory looks like a git
+        // repo (presence of .git/). Fake that with an empty `.git` dir — saves a `git
+        // init` subprocess in the test.
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("custom_out")).unwrap();
+        fs::write(root.join("custom_out/foo.rs"), "// gen\n").unwrap();
+        fs::write(root.join(".gitignore"), "custom_out/\n").unwrap();
+        let opts = WalkOptions {
+            respect_gitignore: true,
+            apply_default_excludes: false,
+            custom_excludes: vec![],
+        };
+        let paths = walk_filtered(&root, &opts);
+        assert!(
+            !paths.iter().any(|p| p.components().any(|c| c.as_os_str() == "custom_out")),
+            ".gitignore should hide custom_out/"
+        );
+        // src/ files still appear.
+        assert!(paths.iter().any(|p| p.ends_with("main.rs")));
     }
 }

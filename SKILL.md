@@ -22,6 +22,7 @@ Output: JSON to stdout. Parse `.findings` (array, score-sorted descending).
 - `--blind aggressive` to catch renamed identifiers (Type-2 clones). `--blind mild` for exact-text clones.
 - `--min-jaccard 0.6` is a sensible default. Raise to 0.8 for stricter; lower to 0.4 for more recall.
 - Add `--only-lang Rust` (or `Python`, `JavaScript`, `Go`) to restrict.
+- `.gitignore` + a built-in list (`target`, `node_modules`, `dist`, `build`, `.venv`, `__pycache__`, …) skip build dirs automatically. Add `--exclude PATTERN` (repeatable, gitignore-style) for project-specific noise. Override with `--no-gitignore` / `--no-default-excludes`.
 
 ## Finding shape
 

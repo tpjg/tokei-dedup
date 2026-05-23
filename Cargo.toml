@@ -40,6 +40,7 @@ anyhow = "1"
 thiserror = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 walkdir = "2"
+ignore = "0.4"
 rayon = "1"
 clap = { version = "4", features = ["derive"] }
 tower-lsp = "0.20"
