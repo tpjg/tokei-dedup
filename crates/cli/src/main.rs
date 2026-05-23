@@ -187,7 +187,7 @@ fn main() -> Result<()> {
                     blind: format!("{:?}", opts.blind),
                     backend: result.backend.into(),
                 };
-                html::render(&result.findings, &summary, path)?;
+                html::render(&result.findings, &summary, path, top)?;
                 if !quiet && !json {
                     eprintln!("HTML report: {}", path.display());
                 }

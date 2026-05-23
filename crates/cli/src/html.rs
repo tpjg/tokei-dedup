@@ -3,10 +3,21 @@
 //! Self-contained single file with embedded CSS. For each finding renders side-by-side
 //! source snippets read from disk at report time — if a file moved/changed since the
 //! scan, the snippet shows "[source unavailable]" rather than crashing.
+//!
+//! Two perf-shaped invariants:
+//!
+//! - **Per-render source cache.** A `HashMap<PathBuf, Option<String>>` lives for the
+//!   duration of one `render()` call. Each file is read at most once even when it shows
+//!   up in 20 different findings. On Linux-kernel-scale corpora this drops the HTML
+//!   phase from a minute to a few seconds.
+//! - **Bounded output.** `render()` honors a `max_findings` cap — the caller decides how
+//!   many findings to commit to the HTML file. Callers using `--top N` for the terminal
+//!   report should pass the same `N` here.
 
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokei_dedup_classifier::{Finding, ItemRef};
 
 pub struct Summary {
@@ -21,23 +32,48 @@ pub struct Summary {
     pub backend: String,
 }
 
-pub fn render(findings: &[Finding], summary: &Summary, output: &Path) -> std::io::Result<()> {
+/// In-flight source cache. `None` means we tried to read the file and failed (deleted
+/// since the scan, encoding error, …); the renderer falls back to "[source unavailable]".
+type SnippetCache = HashMap<PathBuf, Option<String>>;
+
+pub fn render(
+    findings: &[Finding],
+    summary: &Summary,
+    output: &Path,
+    max_findings: usize,
+) -> std::io::Result<()> {
+    let to_render = &findings[..max_findings.min(findings.len())];
+
     let mut html = String::with_capacity(64 * 1024);
     html.push_str(HEAD_OPEN);
     html.push_str(STYLE);
     html.push_str(HEAD_CLOSE);
-    html.push_str(&render_summary(summary));
-    if findings.is_empty() {
+    html.push_str(&render_summary(summary, to_render.len()));
+    if to_render.is_empty() {
         html.push_str(r#"<p class="empty">No findings above threshold.</p>"#);
     }
-    for (rank, f) in findings.iter().enumerate() {
-        write!(&mut html, "{}", render_finding(rank + 1, f)).ok();
+    let mut cache: SnippetCache = HashMap::new();
+    for (rank, f) in to_render.iter().enumerate() {
+        write!(&mut html, "{}", render_finding(rank + 1, f, &mut cache)).ok();
     }
     html.push_str(FOOT);
     fs::write(output, html)
 }
 
-fn render_summary(s: &Summary) -> String {
+fn render_summary(s: &Summary, displayed: usize) -> String {
+    let truncated_note = if displayed < s.findings {
+        format!(
+            r#"<dt>Showing</dt><dd>top {displayed} of {total} (use --top to widen)</dd>"#,
+            displayed = displayed,
+            total = s.findings,
+        )
+    } else {
+        format!(
+            r#"<dt>Showing</dt><dd>all {displayed}</dd>"#,
+            displayed = displayed,
+        )
+    };
+
     format!(
         r#"<h1>tokei-dedup report</h1>
 <dl class="summary">
@@ -49,6 +85,7 @@ fn render_summary(s: &Summary) -> String {
   <dt>Entries indexed</dt><dd>{entries}</dd>
   <dt>Candidate pairs</dt><dd>{cand}</dd>
   <dt>Findings (post-classify)</dt><dd>{findings}</dd>
+  {truncated_note}
   <dt>Elapsed</dt><dd>{secs:.2}s</dd>
 </dl>
 "#,
@@ -60,11 +97,12 @@ fn render_summary(s: &Summary) -> String {
         entries = s.entries,
         cand = s.candidate_pairs,
         findings = s.findings,
+        truncated_note = truncated_note,
         secs = s.elapsed_secs,
     )
 }
 
-fn render_finding(rank: usize, f: &Finding) -> String {
+fn render_finding(rank: usize, f: &Finding, cache: &mut SnippetCache) -> String {
     let tags_html: String = f
         .tags
         .iter()
@@ -97,12 +135,12 @@ fn render_finding(rank: usize, f: &Finding) -> String {
         a_total = f.a.unique_fps,
         b_total = f.b.unique_fps,
         tags = tags_html,
-        pane_a = render_pane(&f.a),
-        pane_b = render_pane(&f.b),
+        pane_a = render_pane(&f.a, cache),
+        pane_b = render_pane(&f.b, cache),
     )
 }
 
-fn render_pane(item: &ItemRef) -> String {
+fn render_pane(item: &ItemRef, cache: &mut SnippetCache) -> String {
     let header = match &item.granule {
         Some(g) => {
             let name = g.fn_name.as_deref().unwrap_or("<anonymous>");
@@ -117,8 +155,8 @@ fn render_pane(item: &ItemRef) -> String {
         None => item.path.display().to_string(),
     };
     let snippet = match &item.granule {
-        Some(g) => extract_lines(&item.path, g.line_start, g.line_end),
-        None => extract_lines(&item.path, 1, 30),
+        Some(g) => extract_lines(&item.path, g.line_start, g.line_end, cache),
+        None => extract_lines(&item.path, 1, 30, cache),
     };
     format!(
         r#"<div class="pane">
@@ -131,10 +169,6 @@ fn render_pane(item: &ItemRef) -> String {
     )
 }
 
-/// Render a code snippet with leading line numbers in `<span class="ln">`. The line
-/// number column is part of the same `<pre>` block so click-to-copy still grabs the
-/// raw code without numbers (since they're inside their own spans we visually offset
-/// via CSS user-select).
 fn render_numbered_snippet(text: &str, first_line: Option<u32>) -> String {
     let mut out = String::with_capacity(text.len() * 5 / 4);
     for (idx, line) in text.lines().enumerate() {
@@ -144,10 +178,19 @@ fn render_numbered_snippet(text: &str, first_line: Option<u32>) -> String {
     out
 }
 
-fn extract_lines(path: &Path, line_start: u32, line_end: u32) -> String {
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return "[source unavailable]".into(),
+fn extract_lines(
+    path: &Path,
+    line_start: u32,
+    line_end: u32,
+    cache: &mut SnippetCache,
+) -> String {
+    // `entry().or_insert_with` reads each file at most once per `render()` call. None
+    // means we tried and failed; subsequent lookups skip the I/O and return immediately.
+    let entry = cache
+        .entry(path.to_path_buf())
+        .or_insert_with(|| fs::read_to_string(path).ok());
+    let Some(content) = entry.as_deref() else {
+        return "[source unavailable]".into();
     };
     let lines: Vec<&str> = content.lines().collect();
     let ls = (line_start.saturating_sub(1) as usize).min(lines.len());
@@ -327,11 +370,32 @@ mod tests {
             blind: "Aggressive".into(),
             backend: "lsh".into(),
         };
-        let s_html = render_summary(&s);
+        let s_html = render_summary(&s, 5);
         assert!(s_html.contains("/tmp/x"));
         assert!(s_html.contains("Function"));
         assert!(s_html.contains("Aggressive"));
         assert!(s_html.contains("1.23"));
         assert!(s_html.contains("100"));
+        assert!(s_html.contains("all 5"));
+    }
+
+    #[test]
+    fn render_summary_shows_truncation_note() {
+        let s = Summary {
+            scan_dir: "/x".into(),
+            scanned_files: 100,
+            entries: 200,
+            candidate_pairs: 50,
+            findings: 1000,
+            elapsed_secs: 1.0,
+            granularity: "Function".into(),
+            blind: "Mild".into(),
+            backend: "lsh".into(),
+        };
+        let s_html = render_summary(&s, 50);
+        assert!(
+            s_html.contains("top 50 of 1000"),
+            "expected truncation note, got:\n{s_html}"
+        );
     }
 }
