@@ -9,3 +9,4 @@ description = "Inverted-index over fingerprint hashes; reports candidate duplica
 
 [dependencies]
 tokei-dedup-fingerprinter = { workspace = true }
+xxhash-rust = { workspace = true }
