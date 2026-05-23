@@ -20,11 +20,11 @@ use xxhash_rust::xxh3::Xxh3;
 
 /// Sub-file region metadata. Carried alongside path/lang for function-level entries
 /// (milestone 3+). `None` on a `FileMeta` means the entry is the whole file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GranuleInfo {
-    pub fn_name: Option<String>,
     pub line_start: u32,
     pub line_end: u32,
+    pub fn_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +267,16 @@ impl LshIndex {
             .get(id as usize)
             .map(|m| m.alive)
             .unwrap_or(false)
+    }
+
+    /// Currently-live IDs that belong to `path` (one entry per granule in
+    /// function mode, one entry in file mode). Returns empty if the path
+    /// isn't in the index. Useful before calling
+    /// [`remove_by_path`](Self::remove_by_path) — the engine layer captures
+    /// these so it can enumerate "what pairs are about to be invalidated"
+    /// before tombstoning kicks in.
+    pub fn ids_for_path(&self, path: &Path) -> Vec<u32> {
+        self.path_to_ids.get(path).cloned().unwrap_or_default()
     }
 
     /// Register a whole-file entry with its precomputed MinHash sketch.
