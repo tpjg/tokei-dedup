@@ -134,7 +134,7 @@ Tags that may appear on a finding (any combination):
 
 `dupe-lsp` runs over stdio. On `initialize`, it scans the workspace once and **eagerly publishes diagnostics for every affected file** — so the editor's "Problems" / "Project Diagnostics" panel populates immediately, without needing to open each file first. On `didSave`, a debounced (500 ms) full-workspace rescan runs in the background, picks up new and removed clones, and re-publishes; this is fast enough for repos in the hundreds-of-thousands of lines (Rust+Gleam: ~340 kLOC scanned in under a second on a laptop). True incremental re-indexing is milestone-6 work.
 
-Diagnostics are tiered by score: the top 20 findings (configurable) get `INFORMATION` severity so they surface in editor panels; the long tail gets `HINT` (faint inline only). Each diagnostic links to the other endpoint via LSP related-information.
+Diagnostics are tiered by score: the top 20 findings (configurable) get `WARNING` severity so they surface in editor "Problems" panels (Zed and some other editors hide `INFORMATION` from the project view by default, so `WARNING` is the safest visible default); the long tail gets `HINT` (faint inline only). Each diagnostic links to the other endpoint via LSP related-information.
 
 ### Configuration (`initializationOptions`)
 
@@ -147,7 +147,7 @@ The defaults are intentionally strict — function-granularity, aggressive blind
 | `minJaccard` | number in `[0, 1]` | `0.8` | Lower → more findings, more false positives |
 | `exclude` | string[] | `[]` | Gitignore-style globs added on top of the built-in excludes |
 | `highlightTop` | integer | `20` | Findings ranked 1..N (by score) get the highlight severity |
-| `highlightSeverity` | `"hint" \| "information" \| "warning"` | `"information"` | What the top-N diagnostics surface as |
+| `highlightSeverity` | `"hint" \| "information" \| "warning"` | `"warning"` | What the top-N diagnostics surface as. **Use `"warning"` (the default) for Zed** — Zed filters `INFORMATION`-level diagnostics out of the project panel |
 | `tailSeverity` | `"hint" \| "information" \| "warning" \| "off"` | `"hint"` | Severity for findings outside the top; `"off"` drops them entirely |
 | `rescanOnSave` | boolean | `true` | Re-run full workspace scan on every `didSave` (debounced 500 ms). Turn off if scan time on your repo exceeds ~2 s |
 

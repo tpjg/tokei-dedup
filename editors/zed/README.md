@@ -28,17 +28,22 @@ Zed will compile the extension to WebAssembly and load it.
 
 ## Configure
 
-Put your settings in `~/.config/zed/settings.json`. The defaults are intentionally strict (Jaccard floor 0.8, function granularity, aggressive blinding) — widen them here if you want more findings:
+Defaults work out of the box: Jaccard floor 0.8, function granularity, aggressive blinding, top-20 findings at `WARNING` severity (so they appear in Zed's "Project Diagnostics" panel), long tail at `HINT`, rescan-on-save on.
+
+> **Why `WARNING` and not `INFORMATION`?** Zed (and several other editors) hide `INFORMATION`-level diagnostics from the project diagnostics panel by default. The default is `WARNING` so findings surface without further configuration.
+
+A field-tested config that's a bit stricter than the defaults (fewer, higher-confidence findings):
 
 ```jsonc
 {
   "lsp": {
     "dupe-lsp": {
       "initialization_options": {
-        "granularity": "function",
-        "blind": "aggressive",
-        "minJaccard": 0.7,
-        "exclude": ["**/generated/**", "vendor/**"]
+        "minJaccard": 0.9,
+        "highlightTop": 10,
+        "highlightSeverity": "warning",
+        "tailSeverity": "hint",
+        "rescanOnSave": true
       }
     }
   }
@@ -59,7 +64,7 @@ If `dupe-lsp` isn't on `$PATH`, pin its location:
 
 ## Schema
 
-See the [main README's LSP section](../../README.md#configuration-initializationoptions) for the full `initialization_options` schema.
+See the [main README's LSP section](../../README.md#configuration-initializationoptions) for the full `initialization_options` schema and every supported key.
 
 ## Languages covered
 

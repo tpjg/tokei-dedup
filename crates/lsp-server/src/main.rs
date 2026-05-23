@@ -76,7 +76,12 @@ struct PublishOptions {
 fn default_publish_opts() -> PublishOptions {
     PublishOptions {
         highlight_top: 20,
-        highlight_severity: DiagnosticSeverity::INFORMATION,
+        // WARNING (not INFORMATION) because Zed — and several other
+        // editors — hide INFORMATION-level diagnostics from the project
+        // panel by default. "Possible clone" is arguably warning-grade
+        // attention anyway. Downgrade via `highlightSeverity` if you want
+        // it quieter.
+        highlight_severity: DiagnosticSeverity::WARNING,
         tail_severity: Some(DiagnosticSeverity::HINT),
         rescan_on_save: true,
     }
@@ -615,7 +620,9 @@ mod tests {
         let (_scan, pub_opts, warns) = resolve_init_opts(None);
         assert!(warns.is_empty());
         assert_eq!(pub_opts.highlight_top, 20);
-        assert_eq!(pub_opts.highlight_severity, DiagnosticSeverity::INFORMATION);
+        // Default is WARNING — INFORMATION is filtered out of Zed's
+        // project diagnostics panel.
+        assert_eq!(pub_opts.highlight_severity, DiagnosticSeverity::WARNING);
         assert_eq!(pub_opts.tail_severity, Some(DiagnosticSeverity::HINT));
         assert!(pub_opts.rescan_on_save);
     }
@@ -664,7 +671,7 @@ mod tests {
     fn unknown_severity_warns_and_keeps_default() {
         let raw = json!({ "highlightSeverity": "nonsense" });
         let (_scan, pub_opts, warns) = resolve_init_opts(Some(&raw));
-        assert_eq!(pub_opts.highlight_severity, DiagnosticSeverity::INFORMATION);
+        assert_eq!(pub_opts.highlight_severity, DiagnosticSeverity::WARNING);
         assert!(
             warns.iter().any(|w| w.contains("highlightSeverity") && w.contains("nonsense")),
             "expected warning naming the bad value; got {warns:?}"
@@ -752,7 +759,7 @@ mod tests {
         for rfs in map.values() {
             for rf in rfs {
                 match rf.severity {
-                    DiagnosticSeverity::INFORMATION => highlighted += 1,
+                    DiagnosticSeverity::WARNING => highlighted += 1,
                     DiagnosticSeverity::HINT => tail += 1,
                     other => panic!("unexpected severity {other:?}"),
                 }
