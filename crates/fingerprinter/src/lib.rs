@@ -1,13 +1,13 @@
-//! Token hashing, k-grams, and MOSS-style winnowing fingerprints.
+//! Token hashing, winnowing fingerprints, and MinHash sketches.
 //!
 //! Pipeline: `&[NormalizedToken]` → `Vec<u64>` (one hash per token) → `Vec<u64>` (one hash
-//! per k-token n-gram) → `Vec<Fingerprint>` (winnowed subset, one per window).
+//! per k-token n-gram) → `Vec<Fingerprint>` (winnowed subset). The MinHash sketch is then
+//! computed over the *set* of winnowed fingerprint hashes for sub-linear pair retrieval
+//! downstream (see `tokei_dedup_index::LshIndex`).
 //!
 //! Defaults follow the MOSS paper:
-//! - `k = 5` — n-gram size. Determines the minimum length match we can detect.
-//! - `w = 4` — winnowing window. Guarantee threshold `t = k + w - 1 = 8`: any match of
-//!   8 or more consecutive identical k-gram hashes is guaranteed to share at least one
-//!   fingerprint.
+//! - `k = 5` — n-gram size.
+//! - `w = 4` — winnowing window. Guarantee threshold `t = k + w - 1 = 8`.
 
 use tokei_dedup_core::{NormalizedToken, TokenKind};
 use xxhash_rust::xxh3::Xxh3;
@@ -107,6 +107,94 @@ pub fn fingerprint_tokens(tokens: &[NormalizedToken], k: usize, window: usize) -
     let token_hashes: Vec<u64> = tokens.iter().map(token_hash).collect();
     let kgrams = k_grams(&token_hashes, k);
     winnowing(&kgrams, window)
+}
+
+// --- MinHash --------------------------------------------------------------------------
+//
+// Classic permutation-based MinHash. For each of K linear hash functions
+// `h_i(x) = a_i * x + b_i mod 2^64` (with `a_i` odd to guarantee a permutation), record
+// `min` of `h_i(x)` over all fingerprint hashes in the file. Two sketches' fraction of
+// matching slots is an unbiased estimator of the Jaccard similarity of the underlying
+// fingerprint sets.
+
+/// MinHash signature length. 128 slots ≈ ±4% standard error on Jaccard estimates.
+pub const SIGNATURE_SIZE: usize = 128;
+
+pub type Sketch = [u64; SIGNATURE_SIZE];
+
+/// Holds the K hash-function parameters. Cheap to clone (constant-size arrays).
+#[derive(Debug, Clone)]
+pub struct MinHasher {
+    a: [u64; SIGNATURE_SIZE],
+    b: [u64; SIGNATURE_SIZE],
+}
+
+impl MinHasher {
+    /// Deterministic constructor: same `seed` yields identical hash functions across
+    /// runs, so sketches stored in one run can be compared with sketches from another.
+    pub fn new(seed: u64) -> Self {
+        let mut a = [0u64; SIGNATURE_SIZE];
+        let mut b = [0u64; SIGNATURE_SIZE];
+        for i in 0..SIGNATURE_SIZE {
+            let ai = mix(seed, i as u64, 0xA1);
+            // `a` must be odd so `a * x mod 2^64` is a permutation.
+            a[i] = ai | 1;
+            b[i] = mix(seed, i as u64, 0xB2);
+        }
+        Self { a, b }
+    }
+
+    /// Compute the MinHash sketch over a set of fingerprint hashes. Duplicate inputs are
+    /// harmless — they only ever match an existing min — so the caller can pass either
+    /// the raw `Fingerprint::hash` stream or a deduplicated set.
+    pub fn sketch(&self, fingerprint_hashes: &[u64]) -> Sketch {
+        let mut sig = [u64::MAX; SIGNATURE_SIZE];
+        for &x in fingerprint_hashes {
+            self.update_sketch(&mut sig, x);
+        }
+        sig
+    }
+
+    /// Convenience: pull `hash` out of each Fingerprint and sketch.
+    pub fn sketch_fingerprints(&self, fps: &[Fingerprint]) -> Sketch {
+        let mut sig = [u64::MAX; SIGNATURE_SIZE];
+        for f in fps {
+            self.update_sketch(&mut sig, f.hash);
+        }
+        sig
+    }
+
+    #[inline]
+    fn update_sketch(&self, sig: &mut Sketch, x: u64) {
+        for (i, slot) in sig.iter_mut().enumerate() {
+            let h = self.a[i].wrapping_mul(x).wrapping_add(self.b[i]);
+            if h < *slot {
+                *slot = h;
+            }
+        }
+    }
+}
+
+/// Default MinHasher seed used across the workspace. Pinned so persisted sketches stay
+/// comparable.
+pub const DEFAULT_MINHASH_SEED: u64 = 0x736b65746368u64; // "sketch"
+
+/// Estimated Jaccard similarity = fraction of identical slots across the two signatures.
+pub fn jaccard_from_sketches(a: &Sketch, b: &Sketch) -> f32 {
+    let mut matches = 0u32;
+    for i in 0..SIGNATURE_SIZE {
+        if a[i] == b[i] {
+            matches += 1;
+        }
+    }
+    matches as f32 / SIGNATURE_SIZE as f32
+}
+
+fn mix(seed: u64, idx: u64, tag: u64) -> u64 {
+    let mut h = Xxh3::with_seed(seed);
+    h.update(&idx.to_le_bytes());
+    h.update(&tag.to_le_bytes());
+    h.digest()
 }
 
 #[cfg(test)]
@@ -227,5 +315,64 @@ mod tests {
         let fa = fingerprint_tokens(&a, 3, 2);
         let fb = fingerprint_tokens(&b, 3, 2);
         assert_ne!(fa, fb);
+    }
+
+    // --- MinHash tests -------------------------------------------------------------
+
+    #[test]
+    fn minhash_deterministic_with_seed() {
+        let mh1 = MinHasher::new(42);
+        let mh2 = MinHasher::new(42);
+        let fps = vec![1u64, 2, 3, 4, 5];
+        assert_eq!(mh1.sketch(&fps), mh2.sketch(&fps));
+    }
+
+    #[test]
+    fn minhash_sketch_identical_for_same_set() {
+        let mh = MinHasher::new(DEFAULT_MINHASH_SEED);
+        let set = vec![10u64, 20, 30, 40, 50, 60, 70, 80];
+        let s1 = mh.sketch(&set);
+        let mut shuffled = set.clone();
+        shuffled.reverse();
+        let s2 = mh.sketch(&shuffled);
+        // MinHash is order-independent: same input set → identical sketch.
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn minhash_disjoint_sets_estimate_near_zero() {
+        let mh = MinHasher::new(DEFAULT_MINHASH_SEED);
+        let a: Vec<u64> = (0..200).collect();
+        let b: Vec<u64> = (1000..1200).collect();
+        let est = jaccard_from_sketches(&mh.sketch(&a), &mh.sketch(&b));
+        assert!(est < 0.10, "disjoint sets should estimate near 0, got {est}");
+    }
+
+    #[test]
+    fn minhash_full_overlap_estimate_one() {
+        let mh = MinHasher::new(DEFAULT_MINHASH_SEED);
+        let set: Vec<u64> = (0..50).collect();
+        let est = jaccard_from_sketches(&mh.sketch(&set), &mh.sketch(&set));
+        assert!((est - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn minhash_estimate_tracks_true_jaccard() {
+        // Two sets sharing 100 of 200 elements each → true Jaccard = 100 / (200+200-100) = 1/3.
+        let mh = MinHasher::new(DEFAULT_MINHASH_SEED);
+        let common: Vec<u64> = (0..100).collect();
+        let a_only: Vec<u64> = (100..200).collect();
+        let b_only: Vec<u64> = (200..300).collect();
+        let mut a = common.clone();
+        a.extend(&a_only);
+        let mut b = common.clone();
+        b.extend(&b_only);
+        let est = jaccard_from_sketches(&mh.sketch(&a), &mh.sketch(&b));
+        let truth = 1.0 / 3.0;
+        // ±5σ for 128-slot MinHash with p=1/3 is ~0.21. Plenty of margin.
+        assert!(
+            (est - truth).abs() < 0.10,
+            "MinHash estimate {est} too far from truth {truth}"
+        );
     }
 }
