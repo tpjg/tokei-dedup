@@ -1,0 +1,20 @@
+[package]
+name = "tokei-dedup-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "tokei-dedup scan pipeline: walk → normalize → fingerprint → sketch → index → verify → classify"
+
+[dependencies]
+tokei-dedup-core = { workspace = true }
+tokei-dedup-lang-config = { workspace = true }
+tokei-dedup-normalizer = { workspace = true }
+tokei-dedup-fingerprinter = { workspace = true }
+tokei-dedup-index = { workspace = true }
+tokei-dedup-slicer = { workspace = true }
+tokei-dedup-verifier = { workspace = true }
+tokei-dedup-classifier = { workspace = true }
+walkdir = { workspace = true }
+rayon = { workspace = true }
