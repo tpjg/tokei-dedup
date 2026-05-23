@@ -5,10 +5,14 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "tokei-dedup LSP server binary (stub — see DESIGN.md)"
+description = "tokei-dedup LSP server — publishes clone diagnostics for the current workspace"
 
 [[bin]]
 name = "dupe-lsp"
 path = "src/main.rs"
 
 [dependencies]
+tokei-dedup-classifier = { workspace = true }
+tokei-dedup-engine = { workspace = true }
+tower-lsp = { workspace = true }
+tokio = { workspace = true }
