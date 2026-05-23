@@ -21,7 +21,7 @@ Output: JSON to stdout. Parse `.findings` (array, score-sorted descending).
 - `--granularity function` for actionable findings (per-function). `--granularity file` for whole-file.
 - `--blind aggressive` to catch renamed identifiers (Type-2 clones). `--blind mild` for exact-text clones.
 - `--min-jaccard 0.6` is a sensible default. Raise to 0.8 for stricter; lower to 0.4 for more recall.
-- Add `--only-lang Rust` (or `Python`, `JavaScript`, `Go`) to restrict.
+- Add `--only-lang <KEY>` to restrict. Function-mode supports `Rust`, `Python`, `JavaScript`, `TypeScript`, `Go`, `Java`, `C` (+`CHeader`), `Cpp` (+`CppHeader`/`CppModule`/`ObjectiveCpp`), `Ruby`, `CSharp`, `Gleam`. Other languages fall back to file mode automatically.
 - `.gitignore` + a built-in list (`target`, `node_modules`, `dist`, `build`, `.venv`, `__pycache__`, …) skip build dirs automatically. Add `--exclude PATTERN` (repeatable, gitignore-style) for project-specific noise. Override with `--no-gitignore` / `--no-default-excludes`.
 
 ## Finding shape

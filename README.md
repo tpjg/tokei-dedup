@@ -56,7 +56,7 @@ dupe scan src/ --granularity function --json
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--granularity {file,function}` | `file` | `function` slices each file via tree-sitter; supported langs: Rust, Python, JavaScript, Go |
+| `--granularity {file,function}` | `file` | `function` slices each file via tree-sitter; see [Language support](#language-support) for the eleven covered languages |
 | `--blind {strict,mild,aggressive}` | `mild` | `mild` blinds literals; `aggressive` also blinds identifiers (catches renamed Type-2 clones) |
 | `--min-jaccard <F>` | `0.5` | Threshold for the LSH path (default backend) |
 | `--top <N>` | `20` | Number of pairs to print in the terminal report |
@@ -162,6 +162,31 @@ language-servers = [ "rust-analyzer", "dupe-lsp" ]
 ## For Claude Code (and other AI agents)
 
 Use the **CLI in `--json` mode**. The LSP is designed for interactive editors and doesn't suit a one-shot analysis. See [`SKILL.md`](./SKILL.md).
+
+## Language support
+
+Two layers, with different coverage:
+
+- **Tokenizer** (file-mode counts, comment/string FSM, fingerprints): **all 332 languages** from the vendored tokei `languages.json`. Any file with a known extension is fingerprinted at file granularity.
+- **Function slicer** (tree-sitter, required for `--granularity function`):
+
+  | Tokei key(s) | Captures |
+  |---|---|
+  | `Rust` | `fn` items at module level and inside `impl` blocks |
+  | `Python` | `def` at module level and inside classes |
+  | `JavaScript` | `function` declarations, `class` methods |
+  | `TypeScript` | `function` declarations, `class` methods (anonymous arrows skipped) |
+  | `Go` | `func` declarations and method receivers |
+  | `Java` | methods and constructors |
+  | `C`, `CHeader` | function definitions |
+  | `Cpp`, `CppHeader`, `CppModule`, `ObjectiveCpp` | free functions, class methods, `Foo::bar` qualified methods |
+  | `Ruby` | `def` methods, `singleton_method` (`def self.x`) |
+  | `CSharp` | methods, constructors, destructors |
+  | `Gleam` | top-level `fn` declarations |
+
+Any other language falls back to file granularity automatically when `--granularity function` is passed — no error, just no functions extracted.
+
+Adding a language is one new query string and one `bundles.insert(...)` line in `crates/slicer/src/lib.rs`. Strong runner-ups for the next batch: PHP, Kotlin, Swift, Scala, Bash, TSX.
 
 ## Architecture
 
