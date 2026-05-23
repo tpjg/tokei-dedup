@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "tokei-dedup fingerprinter stage (stub — see DESIGN.md)"
+description = "Token hashing, k-grams, and MOSS-style winnowing fingerprints"
 
 [dependencies]
+tokei-dedup-core = { workspace = true }
+xxhash-rust = { workspace = true }
