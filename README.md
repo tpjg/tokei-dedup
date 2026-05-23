@@ -132,7 +132,20 @@ Tags that may appear on a finding (any combination):
 
 ## LSP server: `dupe-lsp`
 
-`dupe-lsp` runs over stdio. On `initialize`, it scans the workspace once with `--granularity function --blind aggressive --min-jaccard 0.6`, then publishes `HINT`-severity diagnostics on `didOpen` and `didSave`. Each diagnostic marks the function in the current file and links to the other endpoint via LSP related-information.
+`dupe-lsp` runs over stdio. On `initialize`, it scans the workspace once, then publishes `HINT`-severity diagnostics on `didOpen` and `didSave`. Each diagnostic marks the function in the current file and links to the other endpoint via LSP related-information.
+
+### Configuration (`initializationOptions`)
+
+The defaults are intentionally strict — function-granularity, aggressive blinding, Jaccard floor of **0.8**. Widen via standard LSP `initializationOptions`:
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `granularity` | `"file" \| "function"` | `"function"` | Coarser file-mode is faster but noisier |
+| `blind` | `"strict" \| "mild" \| "aggressive"` | `"aggressive"` | `aggressive` catches renamed Type-2 clones |
+| `minJaccard` | number in `[0, 1]` | `0.8` | Lower → more findings, more false positives |
+| `exclude` | string[] | `[]` | Gitignore-style globs added on top of the built-in excludes |
+
+Unknown keys are tolerated (forward-compat); malformed values produce a `WARNING` log on the client and fall back to defaults.
 
 ### VS Code
 
@@ -140,8 +153,12 @@ Add to `.vscode/settings.json` or a small extension wrapper:
 
 ```jsonc
 {
-  "languageServerExample.serverPath": "/path/to/dupe-lsp"
-  // wire via your favorite generic-LSP-client extension
+  "languageServerExample.serverPath": "/path/to/dupe-lsp",
+  // pass through your generic-LSP-client extension's initializationOptions hook:
+  "languageServerExample.initializationOptions": {
+    "minJaccard": 0.7,
+    "exclude": ["**/generated/**"]
+  }
 }
 ```
 
@@ -159,7 +176,14 @@ if not configs.dupe_lsp then
     },
   }
 end
-lspconfig.dupe_lsp.setup({})
+lspconfig.dupe_lsp.setup({
+  init_options = {
+    granularity = "function",
+    blind = "aggressive",
+    minJaccard = 0.7,
+    exclude = { "**/generated/**" },
+  },
+})
 ```
 
 ### Helix (`.config/helix/languages.toml`)
@@ -167,11 +191,16 @@ lspconfig.dupe_lsp.setup({})
 ```toml
 [language-server.dupe-lsp]
 command = "dupe-lsp"
+config = { granularity = "function", blind = "aggressive", minJaccard = 0.7, exclude = ["**/generated/**"] }
 
 [[language]]
 name = "rust"
 language-servers = [ "rust-analyzer", "dupe-lsp" ]
 ```
+
+### Zed
+
+See the [`editors/zed/`](./editors/zed/) extension for a ready-to-install Zed integration. `initialization_options` are passed via `~/.config/zed/settings.json` under `lsp.dupe-lsp.initialization_options`.
 
 **Caveats:** v1 LSP server has no incremental re-indexing — clone diagnostics reflect the workspace state at server start. Restart `dupe-lsp` to pick up new clones. Incremental updates are milestone 6 work.
 

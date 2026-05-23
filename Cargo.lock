@@ -1702,6 +1702,8 @@ dependencies = [
 name = "tokei-dedup-lsp-server"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "tokei-dedup-classifier",
  "tokei-dedup-engine",
  "tokio",
