@@ -132,11 +132,13 @@ Tags that may appear on a finding (any combination):
 
 ## LSP server: `dupe-lsp`
 
-`dupe-lsp` runs over stdio. On `initialize`, it scans the workspace once, then publishes `HINT`-severity diagnostics on `didOpen` and `didSave`. Each diagnostic marks the function in the current file and links to the other endpoint via LSP related-information.
+`dupe-lsp` runs over stdio. On `initialize`, it scans the workspace once and **eagerly publishes diagnostics for every affected file** — so the editor's "Problems" / "Project Diagnostics" panel populates immediately, without needing to open each file first. On `didSave`, a debounced (500 ms) full-workspace rescan runs in the background, picks up new and removed clones, and re-publishes; this is fast enough for repos in the hundreds-of-thousands of lines (Rust+Gleam: ~340 kLOC scanned in under a second on a laptop). True incremental re-indexing is milestone-6 work.
+
+Diagnostics are tiered by score: the top 20 findings (configurable) get `INFORMATION` severity so they surface in editor panels; the long tail gets `HINT` (faint inline only). Each diagnostic links to the other endpoint via LSP related-information.
 
 ### Configuration (`initializationOptions`)
 
-The defaults are intentionally strict — function-granularity, aggressive blinding, Jaccard floor of **0.8**. Widen via standard LSP `initializationOptions`:
+The defaults are intentionally strict — function-granularity, aggressive blinding, Jaccard floor of **0.8**, top-20 highlighted, rescan on save. Widen via standard LSP `initializationOptions`:
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
@@ -144,6 +146,10 @@ The defaults are intentionally strict — function-granularity, aggressive blind
 | `blind` | `"strict" \| "mild" \| "aggressive"` | `"aggressive"` | `aggressive` catches renamed Type-2 clones |
 | `minJaccard` | number in `[0, 1]` | `0.8` | Lower → more findings, more false positives |
 | `exclude` | string[] | `[]` | Gitignore-style globs added on top of the built-in excludes |
+| `highlightTop` | integer | `20` | Findings ranked 1..N (by score) get the highlight severity |
+| `highlightSeverity` | `"hint" \| "information" \| "warning"` | `"information"` | What the top-N diagnostics surface as |
+| `tailSeverity` | `"hint" \| "information" \| "warning" \| "off"` | `"hint"` | Severity for findings outside the top; `"off"` drops them entirely |
+| `rescanOnSave` | boolean | `true` | Re-run full workspace scan on every `didSave` (debounced 500 ms). Turn off if scan time on your repo exceeds ~2 s |
 
 Unknown keys are tolerated (forward-compat); malformed values produce a `WARNING` log on the client and fall back to defaults.
 
@@ -202,7 +208,7 @@ language-servers = [ "rust-analyzer", "dupe-lsp" ]
 
 See the [`editors/zed/`](./editors/zed/) extension for a ready-to-install Zed integration. `initialization_options` are passed via `~/.config/zed/settings.json` under `lsp.dupe-lsp.initialization_options`.
 
-**Caveats:** v1 LSP server has no incremental re-indexing — clone diagnostics reflect the workspace state at server start. Restart `dupe-lsp` to pick up new clones. Incremental updates are milestone 6 work.
+**Caveats:** `dupe-lsp` rescans the whole workspace on save (debounced 500 ms) rather than incrementally re-fingerprinting the changed file. For small-to-medium repos (up to a few hundred thousand non-comment lines) this is fast enough to feel instant; for larger repos, set `"rescanOnSave": false` and use `editor: restart language server` to manually refresh. True incremental re-indexing is milestone-6 work.
 
 ## For Claude Code (and other AI agents)
 

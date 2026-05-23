@@ -67,5 +67,5 @@ The extension attaches `dupe-lsp` to: Rust, Python, JavaScript, TypeScript, Go, 
 
 ## Caveats
 
-- No incremental re-indexing in v1; restart the Zed server to pick up new clones (`zed: restart language server`).
-- Diagnostics publish on `didOpen` and `didSave` — they appear when you open or save a file, not before.
+- Save triggers a full workspace rescan (debounced 500 ms). For repos where the initial scan exceeds ~2 s, set `"rescanOnSave": false` in `initialization_options` and use `editor: restart language server` for a manual refresh.
+- True incremental re-fingerprinting (touch one file → update only that file's findings) is milestone-6 work; today every save re-scans the whole workspace.
