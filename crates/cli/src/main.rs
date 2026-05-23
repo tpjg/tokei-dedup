@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use tokei_dedup_classifier::ItemRef;
 use tokei_dedup_core::BlindMode;
-use tokei_dedup_engine::{scan, Granularity as EngineGranularity, ScanOptions, ScanResult};
+use tokei_dedup_engine::{scan, Granularity as EngineGranularity, ScanOptions, ScanResult, WalkOptions};
 
 #[derive(Parser)]
 #[command(name = "dupe", version, about)]
@@ -67,6 +67,21 @@ enum Command {
         /// piping into other tools and for agent workflows.
         #[arg(long)]
         json: bool,
+
+        /// Extra gitignore-style pattern to exclude (repeatable). Examples:
+        /// `--exclude target --exclude '**/test_data/**'`.
+        #[arg(long = "exclude", value_name = "PATTERN")]
+        exclude: Vec<String>,
+
+        /// Don't honor `.gitignore` / `.ignore` files or the hidden-file filter.
+        #[arg(long)]
+        no_gitignore: bool,
+
+        /// Don't apply the built-in DEFAULT_EXCLUDES list (target, node_modules,
+        /// dist, build, .venv, …). Use `--no-default-excludes --no-gitignore` to
+        /// scan everything except what you pass to `--exclude`.
+        #[arg(long)]
+        no_default_excludes: bool,
     },
 }
 
@@ -120,6 +135,9 @@ fn main() -> Result<()> {
             quiet,
             html,
             json,
+            exclude,
+            no_gitignore,
+            no_default_excludes,
         } => {
             let opts = ScanOptions {
                 blind: blind.into(),
@@ -131,6 +149,11 @@ fn main() -> Result<()> {
                 min_shared,
                 max_bucket,
                 only_lang,
+                walk: WalkOptions {
+                    respect_gitignore: !no_gitignore,
+                    apply_default_excludes: !no_default_excludes,
+                    custom_excludes: exclude,
+                },
             };
             let result = scan(&dir, &opts);
 
