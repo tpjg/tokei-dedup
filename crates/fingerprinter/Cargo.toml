@@ -1,0 +1,10 @@
+[package]
+name = "tokei-dedup-fingerprinter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "tokei-dedup fingerprinter stage (stub — see DESIGN.md)"
+
+[dependencies]

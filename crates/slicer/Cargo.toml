@@ -1,0 +1,10 @@
+[package]
+name = "tokei-dedup-slicer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "tokei-dedup slicer stage (stub — see DESIGN.md)"
+
+[dependencies]

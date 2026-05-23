@@ -1,0 +1,15 @@
+[package]
+name = "tokei-dedup-lang-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Vendored tokei language definitions parsed into typed Rust structs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+once_cell = "1"
+
+[dev-dependencies]
