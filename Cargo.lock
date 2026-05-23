@@ -1183,6 +1183,9 @@ dependencies = [
 [[package]]
 name = "tokei-dedup-classifier"
 version = "0.0.1"
+dependencies = [
+ "tokei-dedup-verifier",
+]
 
 [[package]]
 name = "tokei-dedup-cli"
@@ -1191,12 +1194,14 @@ dependencies = [
  "anyhow",
  "clap 4.6.1",
  "rayon",
+ "tokei-dedup-classifier",
  "tokei-dedup-core",
  "tokei-dedup-fingerprinter",
  "tokei-dedup-index",
  "tokei-dedup-lang-config",
  "tokei-dedup-normalizer",
  "tokei-dedup-slicer",
+ "tokei-dedup-verifier",
  "walkdir",
 ]
 
