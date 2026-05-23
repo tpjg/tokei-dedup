@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
@@ -24,15 +24,15 @@ repository = "https://github.com/tpjg/tokei-dedup"
 authors = ["tokei-dedup contributors"]
 
 [workspace.dependencies]
-tokei-dedup-core = { path = "crates/core", version = "0.0.1" }
-tokei-dedup-lang-config = { path = "crates/lang-config", version = "0.0.1" }
-tokei-dedup-normalizer = { path = "crates/normalizer", version = "0.0.1" }
-tokei-dedup-fingerprinter = { path = "crates/fingerprinter", version = "0.0.1" }
-tokei-dedup-index = { path = "crates/index", version = "0.0.1" }
-tokei-dedup-slicer = { path = "crates/slicer", version = "0.0.1" }
-tokei-dedup-verifier = { path = "crates/verifier", version = "0.0.1" }
-tokei-dedup-classifier = { path = "crates/classifier", version = "0.0.1" }
-tokei-dedup-engine = { path = "crates/engine", version = "0.0.1" }
+tokei-dedup-core = { path = "crates/core", version = "0.1.0" }
+tokei-dedup-lang-config = { path = "crates/lang-config", version = "0.1.0" }
+tokei-dedup-normalizer = { path = "crates/normalizer", version = "0.1.0" }
+tokei-dedup-fingerprinter = { path = "crates/fingerprinter", version = "0.1.0" }
+tokei-dedup-index = { path = "crates/index", version = "0.1.0" }
+tokei-dedup-slicer = { path = "crates/slicer", version = "0.1.0" }
+tokei-dedup-verifier = { path = "crates/verifier", version = "0.1.0" }
+tokei-dedup-classifier = { path = "crates/classifier", version = "0.1.0" }
+tokei-dedup-engine = { path = "crates/engine", version = "0.1.0" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
