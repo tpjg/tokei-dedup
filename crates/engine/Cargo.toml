@@ -16,5 +16,9 @@ tokei-dedup-index = { workspace = true }
 tokei-dedup-slicer = { workspace = true }
 tokei-dedup-verifier = { workspace = true }
 tokei-dedup-classifier = { workspace = true }
-walkdir = { workspace = true }
+ignore = { workspace = true }
 rayon = { workspace = true }
+
+[dev-dependencies]
+walkdir = { workspace = true }
+tempdir = "0.3"
