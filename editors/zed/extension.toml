@@ -1,0 +1,29 @@
+id = "tokei-dedup"
+name = "tokei-dedup"
+description = "Duplicate-code diagnostics via the dupe-lsp language server"
+version = "0.1.0"
+schema_version = 1
+authors = ["tokei-dedup contributors"]
+repository = "https://github.com/tpjg/tokei-dedup"
+
+# `dupe-lsp` is language-agnostic — it indexes the whole workspace once on
+# initialize and publishes diagnostics for any file the editor opens or
+# saves. List every language the tree-sitter slicer currently supports so
+# users get per-function diagnostics in those languages. Files in other
+# languages still get scanned at file granularity and produce diagnostics
+# when opened, provided you add the language to this list.
+[language_servers.dupe-lsp]
+name = "dupe-lsp"
+languages = [
+  "C",
+  "C++",
+  "C#",
+  "Gleam",
+  "Go",
+  "Java",
+  "JavaScript",
+  "Python",
+  "Ruby",
+  "Rust",
+  "TypeScript",
+]
