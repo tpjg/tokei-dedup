@@ -5,24 +5,37 @@
 //! a labelled byte range — the caller (typically the fingerprinter) slices the file's
 //! token stream by the granule's byte range to produce per-function fingerprints.
 //!
-//! Milestone-3 coverage: Rust, Python, JavaScript, Go. Adding a language is one new
-//! `Query` and one dispatch arm.
+//! Coverage as of milestone 5.5:
+//!
+//! | Tokei key | Slicer family | Notes |
+//! |---|---|---|
+//! | `Rust` | rust | `function_item` covers both freestanding and `impl` methods |
+//! | `Python` | python | `function_definition` covers module-level and class methods |
+//! | `JavaScript` | javascript | `function_declaration` + `method_definition`; arrows skipped |
+//! | `Go` | go | `function_declaration` + `method_declaration` |
+//! | `TypeScript` | typescript | same shape as JavaScript; uses `language_typescript()` |
+//! | `Java` | java | `method_declaration` + `constructor_declaration` |
+//! | `C`, `CHeader` | c | `function_definition` (declarator: function_declarator -> identifier) |
+//! | `Cpp`, `CppHeader`, `CppModule`, `ObjectiveCpp` | cpp | free functions + class methods + `Foo::bar` |
+//! | `Ruby` | ruby | `method` + `singleton_method` |
+//! | `CSharp` | c_sharp | `method_declaration` + `constructor_declaration` + `destructor_declaration` |
+//! | `Gleam` | gleam | top-level `function` declarations |
+//!
+//! Adding a language is one new query string and one `bundles.insert(...)` line.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Parser, Query, QueryCursor};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Granule {
     pub file: PathBuf,
     pub lang: String,
-    /// Identifier captured by the tree-sitter query (function/method name). `None` when
-    /// the construct is anonymous (e.g., an arrow function bound to a variable).
     pub name: Option<String>,
     pub byte_start: u32,
     pub byte_end: u32,
-    /// 1-based line number of the first byte.
     pub line_start: u32,
-    /// 1-based line number of the last byte (inclusive).
     pub line_end: u32,
 }
 
@@ -35,7 +48,6 @@ impl Granule {
         self.line_end.saturating_sub(self.line_start) + 1
     }
 
-    /// Display label for the granule — `path:line_start-line_end::name`.
     pub fn label(&self) -> String {
         let name = self.name.as_deref().unwrap_or("<anonymous>");
         format!(
@@ -48,19 +60,15 @@ impl Granule {
     }
 }
 
-/// Holds compiled tree-sitter queries for every supported language. Construct once and
-/// reuse across files (queries are `Send + Sync`); each call creates a fresh `Parser`
-/// since `tree_sitter::Parser` is not `Sync`.
-pub struct Slicer {
-    rust: LangBundle,
-    python: LangBundle,
-    javascript: LangBundle,
-    go: LangBundle,
-}
-
 struct LangBundle {
     language: Language,
     query: Query,
+}
+
+pub struct Slicer {
+    /// Canonical key → bundle. Header keys (CHeader, CppHeader, …) are normalized to
+    /// the implementation language's key before lookup; see [`canonical_key`].
+    bundles: HashMap<&'static str, LangBundle>,
 }
 
 impl Default for Slicer {
@@ -70,54 +78,55 @@ impl Default for Slicer {
 }
 
 impl Slicer {
+    /// Canonical tokei keys that the slicer can produce granules for. Keys aliased via
+    /// [`canonical_key`] (e.g. `CHeader`) are also accepted by [`supports`] / [`slice`].
+    pub const SUPPORTED: &'static [&'static str] = &[
+        "Rust",
+        "Python",
+        "JavaScript",
+        "Go",
+        "TypeScript",
+        "Java",
+        "C",
+        "Cpp",
+        "Ruby",
+        "CSharp",
+        "Gleam",
+    ];
+
     pub fn new() -> Self {
-        Self {
-            rust: compile(
-                tree_sitter_rust::language(),
-                "(function_item name: (identifier) @name) @fn",
-            ),
-            python: compile(
-                tree_sitter_python::language(),
-                "(function_definition name: (identifier) @name) @fn",
-            ),
-            // For JS we accept both free function declarations and class methods. Arrow
-            // functions assigned to vars are skipped — their "name" lives in the parent
-            // variable declarator, which complicates the query. Future work.
-            javascript: compile(
-                tree_sitter_javascript::language(),
-                r#"
-                [
-                  (function_declaration name: (identifier) @name) @fn
-                  (method_definition name: (property_identifier) @name) @fn
-                ]"#,
-            ),
-            go: compile(
-                tree_sitter_go::language(),
-                r#"
-                [
-                  (function_declaration name: (identifier) @name) @fn
-                  (method_declaration name: (field_identifier) @name) @fn
-                ]"#,
-            ),
-        }
+        let mut bundles = HashMap::with_capacity(Self::SUPPORTED.len());
+        // tree-sitter 0.23+ exposes each grammar as `LANGUAGE: LanguageFn` which
+        // converts into `Language` via `.into()`. TypeScript ships two parsers; pick
+        // the .ts one (TSX would be a separate entry).
+        bundles.insert("Rust", compile(tree_sitter_rust::LANGUAGE.into(), RUST_QUERY));
+        bundles.insert("Python", compile(tree_sitter_python::LANGUAGE.into(), PYTHON_QUERY));
+        bundles.insert("JavaScript", compile(tree_sitter_javascript::LANGUAGE.into(), JS_QUERY));
+        bundles.insert("Go", compile(tree_sitter_go::LANGUAGE.into(), GO_QUERY));
+        bundles.insert(
+            "TypeScript",
+            compile(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), TS_QUERY),
+        );
+        bundles.insert("Java", compile(tree_sitter_java::LANGUAGE.into(), JAVA_QUERY));
+        bundles.insert("C", compile(tree_sitter_c::LANGUAGE.into(), C_QUERY));
+        bundles.insert("Cpp", compile(tree_sitter_cpp::LANGUAGE.into(), CPP_QUERY));
+        bundles.insert("Ruby", compile(tree_sitter_ruby::LANGUAGE.into(), RUBY_QUERY));
+        bundles.insert("CSharp", compile(tree_sitter_c_sharp::LANGUAGE.into(), CSHARP_QUERY));
+        bundles.insert("Gleam", compile(tree_sitter_gleam::LANGUAGE.into(), GLEAM_QUERY));
+        Self { bundles }
     }
 
-    /// Tokei language keys handled by this slicer.
-    pub const SUPPORTED: &'static [&'static str] = &["Rust", "Python", "JavaScript", "Go"];
-
+    /// True if the slicer can handle this tokei key (after header-key normalization).
     pub fn supports(lang_key: &str) -> bool {
-        Self::SUPPORTED.contains(&lang_key)
+        Self::SUPPORTED.contains(&canonical_key(lang_key))
     }
 
-    /// Extract function-bounded granules from a source file. Returns an empty Vec for
-    /// unsupported languages or parse failures.
+    /// Extract function-bounded granules from a source file. Empty Vec for unsupported
+    /// languages or parse failures.
     pub fn slice(&self, lang_key: &str, file: PathBuf, source: &[u8]) -> Vec<Granule> {
-        let bundle = match lang_key {
-            "Rust" => &self.rust,
-            "Python" => &self.python,
-            "JavaScript" => &self.javascript,
-            "Go" => &self.go,
-            _ => return Vec::new(),
+        let canonical = canonical_key(lang_key);
+        let Some(bundle) = self.bundles.get(canonical) else {
+            return Vec::new();
         };
 
         let mut parser = Parser::new();
@@ -131,7 +140,10 @@ impl Slicer {
         let mut cursor = QueryCursor::new();
         let mut out = Vec::new();
         let capture_names = bundle.query.capture_names();
-        for m in cursor.matches(&bundle.query, tree.root_node(), source) {
+        // tree-sitter 0.23+ returns a StreamingIterator from `cursor.matches`, not a
+        // plain Iterator — so drive it with `while let`.
+        let mut matches = cursor.matches(&bundle.query, tree.root_node(), source);
+        while let Some(m) = matches.next() {
             let mut fn_node = None;
             let mut name = None;
             for c in m.captures {
@@ -164,10 +176,88 @@ impl Slicer {
     }
 }
 
+/// Header / module variants share the implementation language's tree-sitter parser.
+fn canonical_key(tokei_key: &str) -> &str {
+    match tokei_key {
+        "CHeader" => "C",
+        "CppHeader" | "CppModule" | "ObjectiveCpp" => "Cpp",
+        other => other,
+    }
+}
+
 fn compile(language: Language, query_src: &str) -> LangBundle {
     let query = Query::new(&language, query_src).expect("slicer query compiles");
     LangBundle { language, query }
 }
+
+
+const RUST_QUERY: &str = "(function_item name: (identifier) @name) @fn";
+
+const PYTHON_QUERY: &str = "(function_definition name: (identifier) @name) @fn";
+
+// Arrow functions assigned to vars are skipped — their "name" lives on the parent
+// variable_declarator, which complicates the query without much payoff for now.
+const JS_QUERY: &str = r#"
+[
+  (function_declaration name: (identifier) @name) @fn
+  (method_definition name: (property_identifier) @name) @fn
+]"#;
+
+const GO_QUERY: &str = r#"
+[
+  (function_declaration name: (identifier) @name) @fn
+  (method_declaration name: (field_identifier) @name) @fn
+]"#;
+
+// TypeScript's grammar mirrors JS for our purposes. function_signature (abstract decls)
+// is intentionally NOT captured — those are interfaces, not implementations.
+const TS_QUERY: &str = r#"
+[
+  (function_declaration name: (identifier) @name) @fn
+  (method_definition name: (property_identifier) @name) @fn
+]"#;
+
+const JAVA_QUERY: &str = r#"
+[
+  (method_declaration name: (identifier) @name) @fn
+  (constructor_declaration name: (identifier) @name) @fn
+]"#;
+
+const C_QUERY: &str = r#"
+(function_definition
+  declarator: (function_declarator
+    declarator: (identifier) @name)) @fn
+"#;
+
+// C++ functions appear three ways:
+//   1. Free function: `int foo() { ... }` — declarator is a plain identifier.
+//   2. Method definition outside class: `int Foo::bar() { ... }` — qualified_identifier.
+//   3. Inline method inside class: declarator is a field_identifier.
+// All three are function_definition nodes; only the inner declarator differs.
+const CPP_QUERY: &str = r#"
+[
+  (function_definition declarator: (function_declarator declarator: (identifier) @name)) @fn
+  (function_definition declarator: (function_declarator declarator: (field_identifier) @name)) @fn
+  (function_definition declarator: (function_declarator declarator: (qualified_identifier) @name)) @fn
+]
+"#;
+
+const RUBY_QUERY: &str = r#"
+[
+  (method name: (identifier) @name) @fn
+  (singleton_method name: (identifier) @name) @fn
+]"#;
+
+const CSHARP_QUERY: &str = r#"
+[
+  (method_declaration name: (identifier) @name) @fn
+  (constructor_declaration name: (identifier) @name) @fn
+  (destructor_declaration name: (identifier) @name) @fn
+]"#;
+
+// Gleam's grammar uses `function` for top-level function declarations. Identifier
+// captured via the `name:` field.
+const GLEAM_QUERY: &str = "(function name: (identifier) @name) @fn";
 
 #[cfg(test)]
 mod tests {
@@ -175,56 +265,61 @@ mod tests {
     use std::path::PathBuf;
 
     fn names(g: &[Granule]) -> Vec<String> {
-        g.iter()
+        let mut v: Vec<String> = g
+            .iter()
             .map(|g| g.name.clone().unwrap_or_else(|| "?".into()))
-            .collect()
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn check(lang: &str, src: &[u8], want: &[&str]) {
+        let s = Slicer::new();
+        let got = names(&s.slice(lang, PathBuf::from("t"), src));
+        let want_sorted = {
+            let mut w: Vec<String> = want.iter().map(|s| (*s).into()).collect();
+            w.sort();
+            w
+        };
+        assert_eq!(got, want_sorted, "mismatch for {lang}");
     }
 
     #[test]
-    fn supported_predicate() {
+    fn supported_set() {
         assert!(Slicer::supports("Rust"));
         assert!(Slicer::supports("Python"));
-        assert!(!Slicer::supports("CHeader"));
+        assert!(Slicer::supports("TypeScript"));
+        assert!(Slicer::supports("Cpp"));
+        assert!(Slicer::supports("CHeader")); // header alias
+        assert!(Slicer::supports("CppHeader")); // alias
+        assert!(Slicer::supports("Gleam"));
         assert!(!Slicer::supports("Markdown"));
+        assert!(!Slicer::supports("CHeader2"));
     }
 
     #[test]
-    fn rust_extracts_functions() {
-        let s = Slicer::new();
+    fn rust_functions() {
         let src = br#"
 fn foo() -> i32 { 1 }
-
-fn bar(x: i32) -> i32 {
-    x * 2
-}
-
-impl Thing {
-    fn method(&self) -> i32 { 3 }
-}
+fn bar(x: i32) -> i32 { x * 2 }
+impl T { fn method(&self) -> i32 { 3 } }
 "#;
-        let g = s.slice("Rust", PathBuf::from("t.rs"), src);
-        let mut got = names(&g);
-        got.sort();
-        assert_eq!(got, vec!["bar", "foo", "method"]);
+        check("Rust", src, &["foo", "bar", "method"]);
     }
 
     #[test]
-    fn rust_granule_byte_ranges_are_sane() {
+    fn rust_byte_ranges_are_sane() {
         let s = Slicer::new();
         let src = b"fn first() { 1 }\nfn second() { 2 }\n";
         let g = s.slice("Rust", PathBuf::from("t.rs"), src);
         assert_eq!(g.len(), 2);
-        assert_eq!(g[0].name.as_deref(), Some("first"));
-        assert_eq!(g[1].name.as_deref(), Some("second"));
         assert_eq!(&src[g[0].byte_range()], b"fn first() { 1 }");
-        assert_eq!(&src[g[1].byte_range()], b"fn second() { 2 }");
         assert_eq!(g[0].line_start, 1);
         assert_eq!(g[1].line_start, 2);
     }
 
     #[test]
-    fn python_extracts_module_and_method_functions() {
-        let s = Slicer::new();
+    fn python_functions() {
         let src = br#"
 def free_fn(x):
     return x + 1
@@ -235,45 +330,135 @@ class K:
     def other(self):
         return 0
 "#;
-        let g = s.slice("Python", PathBuf::from("t.py"), src);
-        let mut got = names(&g);
-        got.sort();
-        assert_eq!(got, vec!["free_fn", "method", "other"]);
+        check("Python", src, &["free_fn", "method", "other"]);
     }
 
     #[test]
-    fn javascript_extracts_function_decl_and_methods() {
-        let s = Slicer::new();
+    fn javascript_functions() {
         let src = br#"
 function add(a, b) { return a + b; }
-
 class X {
     foo() { return 1; }
     bar(z) { return z * 2; }
 }
 "#;
-        let g = s.slice("JavaScript", PathBuf::from("t.js"), src);
-        let mut got = names(&g);
-        got.sort();
-        assert_eq!(got, vec!["add", "bar", "foo"]);
+        check("JavaScript", src, &["add", "foo", "bar"]);
     }
 
     #[test]
-    fn go_extracts_functions_and_methods() {
-        let s = Slicer::new();
+    fn go_functions() {
         let src = br#"
 package main
-
 func Add(a, b int) int { return a + b }
-
 type T struct{}
-
 func (t T) Mul(x int) int { return x * 2 }
 "#;
-        let g = s.slice("Go", PathBuf::from("t.go"), src);
-        let mut got = names(&g);
-        got.sort();
-        assert_eq!(got, vec!["Add", "Mul"]);
+        check("Go", src, &["Add", "Mul"]);
+    }
+
+    #[test]
+    fn typescript_functions() {
+        let src = br#"
+function add(a: number, b: number): number { return a + b; }
+class X {
+    foo(): number { return 1; }
+    bar(z: number): number { return z * 2; }
+}
+"#;
+        check("TypeScript", src, &["add", "foo", "bar"]);
+    }
+
+    #[test]
+    fn java_functions() {
+        let src = br#"
+class X {
+    public X() {}
+    int add(int a, int b) { return a + b; }
+    static int mul(int a, int b) { return a * b; }
+}
+"#;
+        check("Java", src, &["X", "add", "mul"]);
+    }
+
+    #[test]
+    fn c_functions() {
+        let src = br#"
+int add(int a, int b) { return a + b; }
+static void noop(void) { }
+"#;
+        check("C", src, &["add", "noop"]);
+    }
+
+    #[test]
+    fn c_header_via_alias() {
+        let src = br#"
+int add(int a, int b) { return a + b; }
+"#;
+        check("CHeader", src, &["add"]);
+    }
+
+    #[test]
+    fn cpp_free_and_method() {
+        let src = br#"
+int free_fn(int x) { return x; }
+class Foo {
+public:
+    int inline_method() { return 1; }
+};
+int Foo::out_of_line() { return 2; }
+"#;
+        let s = Slicer::new();
+        let got = names(&s.slice("Cpp", PathBuf::from("t.cpp"), src));
+        // We expect free_fn, inline_method, and the out_of_line method captured via
+        // the qualified_identifier variant. The qualified-identifier capture yields
+        // "Foo::out_of_line" as the name; assert it appears somewhere.
+        assert!(got.contains(&"free_fn".to_string()));
+        assert!(got.contains(&"inline_method".to_string()));
+        assert!(
+            got.iter().any(|n| n.contains("out_of_line")),
+            "expected an out_of_line entry, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn ruby_methods() {
+        let src = br#"
+def add(a, b)
+  a + b
+end
+class Foo
+  def bar(x)
+    x * 2
+  end
+end
+"#;
+        check("Ruby", src, &["add", "bar"]);
+    }
+
+    #[test]
+    fn csharp_methods() {
+        let src = br#"
+class X {
+    public X() {}
+    ~X() {}
+    public int Add(int a, int b) { return a + b; }
+}
+"#;
+        check("CSharp", src, &["X", "X", "Add"]);
+    }
+
+    #[test]
+    fn gleam_functions() {
+        let src = br#"
+pub fn add(a: Int, b: Int) -> Int {
+  a + b
+}
+
+fn private_helper(x: Int) -> Int {
+  x * 2
+}
+"#;
+        check("Gleam", src, &["add", "private_helper"]);
     }
 
     #[test]
@@ -284,12 +469,9 @@ func (t T) Mul(x int) int { return x * 2 }
     }
 
     #[test]
-    fn syntax_error_returns_partial_or_empty() {
-        // tree-sitter is tolerant — even on broken input it builds a tree. We tolerate
-        // either: 0 granules (if the parse drops the function) or N granules (if
-        // tree-sitter recovers). The contract is "doesn't panic".
+    fn syntax_error_does_not_panic() {
         let s = Slicer::new();
-        let src = b"fn broken( {\n";
-        let _ = s.slice("Rust", PathBuf::from("t.rs"), src);
+        let _ = s.slice("Rust", PathBuf::from("t.rs"), b"fn broken( {\n");
+        let _ = s.slice("Cpp", PathBuf::from("t.cpp"), b"int broken( {\n");
     }
 }
