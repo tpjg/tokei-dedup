@@ -39,6 +39,16 @@ case "$uname_m" in
   *) die "unsupported architecture: $uname_m" ;;
 esac
 
+# On Darwin we only ship arm64 binaries (GitHub is sunsetting free
+# x86_64 macOS runners). If an x86_64 shell is actually a Rosetta
+# process on an arm64 host, transparently switch to aarch64.
+if [ "$os" = "darwin" ] && [ "$arch" = "x86_64" ]; then
+  if [ "$(sysctl -in sysctl.proc_translated 2>/dev/null || echo 0)" = "1" ] \
+     || [ "$(sysctl -in hw.optional.arm64 2>/dev/null || echo 0)" = "1" ]; then
+    arch=aarch64
+  fi
+fi
+
 case "$os-$arch" in
   linux-x86_64)
     if ldd --version 2>&1 | grep -qi musl; then
@@ -48,8 +58,12 @@ case "$os-$arch" in
     fi
     ;;
   linux-aarch64)  target="aarch64-unknown-linux-gnu" ;;
-  darwin-x86_64)  target="x86_64-apple-darwin" ;;
   darwin-aarch64) target="aarch64-apple-darwin" ;;
+  darwin-x86_64)
+    die "Intel Macs are not supported by prebuilt binaries (GitHub is \
+sunsetting free x86_64 macOS runners). Build from source: \
+https://github.com/$REPO#build-from-source"
+    ;;
   *) die "unsupported platform: $os-$arch" ;;
 esac
 

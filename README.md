@@ -21,7 +21,7 @@ See [`DESIGN.md`](./DESIGN.md) for the long version.
 
 ## Install
 
-Prebuilt binaries for Linux (x86_64 gnu/musl, aarch64 gnu) and macOS (x86_64, aarch64) are published on every `v*` tag.
+Prebuilt binaries for Linux (x86_64 gnu/musl, aarch64 gnu) and macOS (aarch64 / Apple Silicon) are published on every `v*` tag. Intel Macs aren't covered by prebuilt binaries — GitHub is sunsetting the free x86_64 macOS runners; build from source instead.
 
 ```sh
 curl -fsSL https://github.com/tpjg/tokei-dedup/releases/latest/download/install.sh | sh
