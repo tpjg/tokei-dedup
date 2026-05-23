@@ -4,12 +4,15 @@
 //! language (via vendored tokei definitions), winnows fingerprints, and reports the
 //! highest-overlap file pairs.
 
+mod html;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use tokei_dedup_classifier::{classify_with_root, Finding, GranuleRef, ItemRef};
 use tokei_dedup_core::{BlindMode, NormalizedToken};
 use tokei_dedup_fingerprinter::{
     fingerprint_tokens, Fingerprint, MinHasher, Sketch, DEFAULT_MINHASH_SEED,
@@ -18,6 +21,7 @@ use tokei_dedup_index::{GranuleInfo, Index, LshIndex};
 use tokei_dedup_lang_config as lang_config;
 use tokei_dedup_normalizer::Normalizer;
 use tokei_dedup_slicer::Slicer;
+use tokei_dedup_verifier::{verify, Verified};
 use walkdir::WalkDir;
 
 #[derive(Parser)]
@@ -79,6 +83,10 @@ enum Command {
         /// Hide per-file progress noise.
         #[arg(long, short)]
         quiet: bool,
+
+        /// Write an HTML report to this path (in addition to the terminal output).
+        #[arg(long)]
+        html: Option<PathBuf>,
     },
 }
 
@@ -121,6 +129,7 @@ fn main() -> Result<()> {
             min_shared,
             max_bucket,
             quiet,
+            html,
         } => scan(ScanArgs {
             dir,
             k,
@@ -134,6 +143,7 @@ fn main() -> Result<()> {
             min_shared,
             max_bucket,
             quiet,
+            html,
         }),
     }
 }
@@ -151,6 +161,7 @@ struct ScanArgs {
     min_shared: u32,
     max_bucket: usize,
     quiet: bool,
+    html: Option<PathBuf>,
 }
 
 struct Item {
@@ -160,6 +171,9 @@ struct Item {
     fps: Vec<Fingerprint>,
     sketch: Sketch,
     unique_fps: u32,
+    /// Cached unique fingerprint hash set — built once at fingerprint time and reused
+    /// by the verifier without recomputation.
+    unique_set: HashSet<u64>,
 }
 
 fn scan(a: ScanArgs) -> Result<()> {
@@ -209,95 +223,271 @@ fn scan(a: ScanArgs) -> Result<()> {
         );
     }
 
-    let (mut pairs, backend_summary) = if a.use_naive {
-        let mut idx = Index::new();
-        let mut total_fps = 0usize;
-        for e in &items {
-            total_fps += e.fps.len();
-            if let Some(g) = &e.granule {
-                idx.add_granule(e.path.clone(), e.lang, g.clone(), &e.fps);
-            } else {
-                idx.add_file(e.path.clone(), e.lang, &e.fps);
-            }
-        }
-        let summary = format!(
-            "naive: {} entries, {} buckets, {} fingerprints",
-            idx.file_count(),
-            idx.bucket_count(),
-            total_fps,
-        );
-        (idx.pair_report(a.min_shared, a.max_bucket), summary)
+    let (mut findings, backend_summary, candidate_count) = if a.use_naive {
+        run_naive_pipeline(&items, a.min_shared, a.max_bucket, &a.dir)
     } else {
-        let mut idx = LshIndex::with_defaults();
-        for e in &items {
-            if let Some(g) = &e.granule {
-                idx.add_granule(e.path.clone(), e.lang, g.clone(), e.sketch, e.unique_fps);
-            } else {
-                idx.add_file(e.path.clone(), e.lang, e.sketch, e.unique_fps);
-            }
-        }
-        let cand = idx.candidate_pair_count();
-        let summary = format!(
-            "lsh: {} entries, {} band-buckets, {} candidate pairs",
-            idx.file_count(),
-            idx.bucket_count(),
-            cand,
-        );
-        (idx.pair_report(a.min_jaccard), summary)
+        run_lsh_pipeline(&items, a.min_jaccard, &a.dir)
     };
 
-    // Same-file granule pairs (e.g. a function compared to itself when nesting causes
-    // the parent function to be its own granule) are noise — filter them out.
+    // Self-pairs (the same granule on both sides — possible with nested-function
+    // emission) are noise.
     if a.granularity == Granularity::Function {
-        pairs.retain(|p| !(p.file_a == p.file_b && p.granule_a == p.granule_b));
+        findings.retain(|f| !same_endpoint(&f.a, &f.b));
     }
 
     if !a.quiet {
         eprintln!("Index: {backend_summary}");
     }
 
-    pairs.sort_by(|x, y| {
-        y.jaccard
-            .partial_cmp(&x.jaccard)
+    findings.sort_by(|x, y| {
+        y.score
+            .partial_cmp(&x.score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(y.shared.cmp(&x.shared))
     });
 
-    if pairs.is_empty() {
+    if findings.is_empty() {
         println!("No candidate duplicates.");
+        if let Some(html_path) = &a.html {
+            write_html(
+                &findings,
+                &items,
+                candidate_count,
+                a.use_naive,
+                &a,
+                start.elapsed().as_secs_f32(),
+                html_path,
+            )?;
+            eprintln!("HTML report: {}", html_path.display());
+        }
         return Ok(());
     }
 
-    let total = pairs.len();
+    let total = findings.len();
     let shown = a.top.min(total);
-    let approx = if a.use_naive { "" } else { " (estimated)" };
     println!(
-        "Top {} candidate pair(s) of {} (jaccard ↓{}, granularity={:?}, params: k={}, w={}, blind={:?}):",
-        shown, total, approx, a.granularity, a.k, a.window, a.blind,
+        "Top {} finding(s) of {} (score ↓, granularity={:?}, params: k={}, w={}, blind={:?}):",
+        shown, total, a.granularity, a.k, a.window, a.blind,
     );
-    for (rank, p) in pairs.iter().take(a.top).enumerate() {
-        let lang_tag = if p.lang_a == p.lang_b {
-            p.lang_a.clone()
+    for (rank, f) in findings.iter().take(a.top).enumerate() {
+        let lang_tag = if f.a.lang == f.b.lang {
+            f.a.lang.clone()
         } else {
-            format!("{}↔{}", p.lang_a, p.lang_b)
+            format!("{}↔{}", f.a.lang, f.b.lang)
+        };
+        let tag_list = if f.tags.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " [{}]",
+                f.tags
+                    .iter()
+                    .map(|t| t.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
         };
         println!(
-            "  {:>3}. j={:.3} shared={:>4} ({}/{}) [{}]",
+            "  {:>3}. score={:.3} j={:.3} shared={:>4} ({}/{}) [{}]{}",
             rank + 1,
-            p.jaccard,
-            p.shared,
-            p.a_total,
-            p.b_total,
+            f.score,
+            f.exact_jaccard,
+            f.shared,
+            f.a.unique_fps,
+            f.b.unique_fps,
             lang_tag,
+            tag_list,
         );
-        println!("       a: {}", format_endpoint(&p.file_a, p.granule_a.as_ref()));
-        println!("       b: {}", format_endpoint(&p.file_b, p.granule_b.as_ref()));
+        println!("       a: {}", format_item_ref(&f.a));
+        println!("       b: {}", format_item_ref(&f.b));
+    }
+
+    if let Some(html_path) = &a.html {
+        write_html(
+            &findings,
+            &items,
+            candidate_count,
+            a.use_naive,
+            &a,
+            start.elapsed().as_secs_f32(),
+            html_path,
+        )?;
+        eprintln!("HTML report: {}", html_path.display());
     }
 
     if !a.quiet {
         eprintln!("Total wall clock: {:.2}s", start.elapsed().as_secs_f32());
     }
     Ok(())
+}
+
+fn run_lsh_pipeline(
+    items: &[Item],
+    min_jaccard: f32,
+    scan_root: &Path,
+) -> (Vec<Finding>, String, usize) {
+    let mut idx = LshIndex::with_defaults();
+    for e in items {
+        if let Some(g) = &e.granule {
+            idx.add_granule(e.path.clone(), e.lang, g.clone(), e.sketch, e.unique_fps);
+        } else {
+            idx.add_file(e.path.clone(), e.lang, e.sketch, e.unique_fps);
+        }
+    }
+    let candidates = idx.candidate_pairs();
+    let cand_count = candidates.len();
+    let summary = format!(
+        "lsh: {} entries, {} band-buckets, {} candidate pairs",
+        idx.file_count(),
+        idx.bucket_count(),
+        cand_count,
+    );
+    let findings: Vec<Finding> = candidates
+        .into_iter()
+        .filter(|(_, _, est)| *est >= min_jaccard)
+        .filter_map(|(a_id, b_id, est)| {
+            let set_a = &items[a_id as usize].unique_set;
+            let set_b = &items[b_id as usize].unique_set;
+            let v = verify(a_id, b_id, est, set_a, set_b);
+            if v.exact_jaccard < min_jaccard {
+                return None;
+            }
+            let meta_a = idx.meta(a_id);
+            let meta_b = idx.meta(b_id);
+            Some(classify_with_root(
+                &v,
+                meta_to_item_ref(meta_a),
+                meta_to_item_ref(meta_b),
+                Some(scan_root),
+            ))
+        })
+        .collect();
+    (findings, summary, cand_count)
+}
+
+fn run_naive_pipeline(
+    items: &[Item],
+    min_shared: u32,
+    max_bucket: usize,
+    scan_root: &Path,
+) -> (Vec<Finding>, String, usize) {
+    let mut idx = Index::new();
+    let mut total_fps = 0usize;
+    for e in items {
+        total_fps += e.fps.len();
+        if let Some(g) = &e.granule {
+            idx.add_granule(e.path.clone(), e.lang, g.clone(), &e.fps);
+        } else {
+            idx.add_file(e.path.clone(), e.lang, &e.fps);
+        }
+    }
+    let pairs = idx.pair_report(min_shared, max_bucket);
+    let cand_count = pairs.len();
+    let summary = format!(
+        "naive: {} entries, {} buckets, {} fingerprints",
+        idx.file_count(),
+        idx.bucket_count(),
+        total_fps,
+    );
+    let findings: Vec<Finding> = pairs
+        .into_iter()
+        .map(|p| {
+            let union = (p.a_total + p.b_total).saturating_sub(p.shared);
+            let v = Verified {
+                a_id: 0,
+                b_id: 0,
+                exact_jaccard: p.jaccard,
+                estimated_jaccard: p.jaccard,
+                shared: p.shared,
+                union,
+            };
+            let a = ItemRef {
+                path: p.file_a,
+                lang: p.lang_a,
+                granule: p.granule_a.as_ref().map(to_classifier_granule),
+                unique_fps: p.a_total,
+            };
+            let b = ItemRef {
+                path: p.file_b,
+                lang: p.lang_b,
+                granule: p.granule_b.as_ref().map(to_classifier_granule),
+                unique_fps: p.b_total,
+            };
+            classify_with_root(&v, a, b, Some(scan_root))
+        })
+        .collect();
+    (findings, summary, cand_count)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_html(
+    findings: &[Finding],
+    items: &[Item],
+    candidate_pairs: usize,
+    use_naive: bool,
+    a: &ScanArgs,
+    elapsed_secs: f32,
+    output: &Path,
+) -> Result<()> {
+    let summary = html::Summary {
+        scan_dir: a.dir.display().to_string(),
+        scanned_files: items
+            .iter()
+            .map(|i| i.path.as_path())
+            .collect::<HashSet<_>>()
+            .len(),
+        entries: items.len(),
+        candidate_pairs,
+        findings: findings.len(),
+        elapsed_secs,
+        granularity: format!("{:?}", a.granularity),
+        blind: format!("{:?}", a.blind),
+        backend: if use_naive { "naive".into() } else { "lsh".into() },
+    };
+    html::render(findings, &summary, output)?;
+    Ok(())
+}
+
+fn meta_to_item_ref(meta: &tokei_dedup_index::FileMeta) -> ItemRef {
+    ItemRef {
+        path: meta.path.clone(),
+        lang: meta.lang.clone(),
+        granule: meta.granule.as_ref().map(to_classifier_granule),
+        unique_fps: meta.unique_fps,
+    }
+}
+
+fn to_classifier_granule(g: &GranuleInfo) -> GranuleRef {
+    GranuleRef {
+        fn_name: g.fn_name.clone(),
+        line_start: g.line_start,
+        line_end: g.line_end,
+    }
+}
+
+fn same_endpoint(a: &ItemRef, b: &ItemRef) -> bool {
+    a.path == b.path
+        && match (&a.granule, &b.granule) {
+            (Some(ga), Some(gb)) => ga == gb,
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+fn format_item_ref(item: &ItemRef) -> String {
+    match &item.granule {
+        None => item.path.display().to_string(),
+        Some(g) => {
+            let name = g.fn_name.as_deref().unwrap_or("<anonymous>");
+            format!(
+                "{}:{}-{}::{}",
+                item.path.display(),
+                g.line_start,
+                g.line_end,
+                name
+            )
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -368,9 +558,9 @@ fn build_item(
     if fps.is_empty() {
         return None;
     }
-    let unique: HashSet<u64> = fps.iter().map(|f| f.hash).collect();
-    let unique_count = unique.len() as u32;
-    let unique_vec: Vec<u64> = unique.into_iter().collect();
+    let unique_set: HashSet<u64> = fps.iter().map(|f| f.hash).collect();
+    let unique_count = unique_set.len() as u32;
+    let unique_vec: Vec<u64> = unique_set.iter().copied().collect();
     let sketch = minhasher.sketch(&unique_vec);
     Some(Item {
         path,
@@ -379,6 +569,7 @@ fn build_item(
         fps,
         sketch,
         unique_fps: unique_count,
+        unique_set,
     })
 }
 
@@ -389,18 +580,3 @@ fn tokens_in_byte_range(tokens: &[NormalizedToken], start: u32, end: u32) -> &[N
     &tokens[lo..hi]
 }
 
-fn format_endpoint(path: &Path, granule: Option<&GranuleInfo>) -> String {
-    match granule {
-        None => path.display().to_string(),
-        Some(g) => {
-            let name = g.fn_name.as_deref().unwrap_or("<anonymous>");
-            format!(
-                "{}:{}-{}::{}",
-                path.display(),
-                g.line_start,
-                g.line_end,
-                name
-            )
-        }
-    }
-}

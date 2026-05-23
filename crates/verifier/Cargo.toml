@@ -5,6 +5,6 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "tokei-dedup verifier stage (stub — see DESIGN.md)"
+description = "Exact-Jaccard verification of LSH candidate pairs"
 
 [dependencies]

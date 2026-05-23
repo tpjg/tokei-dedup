@@ -328,6 +328,31 @@ impl LshIndex {
     }
 
     pub fn candidate_pair_count(&self) -> usize {
+        self.candidate_pairs_raw().len()
+    }
+
+    /// Distinct candidate pairs from the band buckets, each paired with the estimated
+    /// Jaccard derived from the full sketch. The downstream verifier replaces the
+    /// estimate with the exact value using the original fingerprint sets.
+    pub fn candidate_pairs(&self) -> Vec<(u32, u32, f32)> {
+        self.candidate_pairs_raw()
+            .into_iter()
+            .map(|(a, b)| {
+                let est = jaccard_from_sketches(
+                    &self.sketches[a as usize],
+                    &self.sketches[b as usize],
+                );
+                (a, b, est)
+            })
+            .collect()
+    }
+
+    /// Lookup the metadata that was recorded at `add_file` / `add_granule` time.
+    pub fn meta(&self, id: u32) -> &FileMeta {
+        &self.files[id as usize]
+    }
+
+    fn candidate_pairs_raw(&self) -> Vec<(u32, u32)> {
         let mut candidates: HashSet<(u32, u32)> = HashSet::new();
         for files in self.buckets.values() {
             if files.len() < 2 {
@@ -342,7 +367,7 @@ impl LshIndex {
                 }
             }
         }
-        candidates.len()
+        candidates.into_iter().collect()
     }
 }
 

@@ -18,6 +18,8 @@ tokei-dedup-normalizer = { workspace = true }
 tokei-dedup-fingerprinter = { workspace = true }
 tokei-dedup-index = { workspace = true }
 tokei-dedup-slicer = { workspace = true }
+tokei-dedup-verifier = { workspace = true }
+tokei-dedup-classifier = { workspace = true }
 clap = { workspace = true }
 walkdir = { workspace = true }
 rayon = { workspace = true }
@@ -30,4 +32,6 @@ tokei-dedup-normalizer = { workspace = true }
 tokei-dedup-fingerprinter = { workspace = true }
 tokei-dedup-index = { workspace = true }
 tokei-dedup-slicer = { workspace = true }
+tokei-dedup-verifier = { workspace = true }
+tokei-dedup-classifier = { workspace = true }
 walkdir = { workspace = true }
