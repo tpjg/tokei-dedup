@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "tokei-dedup slicer stage (stub — see DESIGN.md)"
+description = "Function-bounded slicing of source files via tree-sitter"
 
 [dependencies]
+tree-sitter = "0.22"
+tree-sitter-rust = "0.21"
+tree-sitter-python = "0.21"
+tree-sitter-javascript = "0.21"
+tree-sitter-go = "0.21"

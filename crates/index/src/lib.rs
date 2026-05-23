@@ -18,13 +18,24 @@ use std::path::PathBuf;
 use tokei_dedup_fingerprinter::{jaccard_from_sketches, Fingerprint, Sketch, SIGNATURE_SIZE};
 use xxhash_rust::xxh3::Xxh3;
 
+/// Sub-file region metadata. Carried alongside path/lang for function-level entries
+/// (milestone 3+). `None` on a `FileMeta` means the entry is the whole file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GranuleInfo {
+    pub fn_name: Option<String>,
+    pub line_start: u32,
+    pub line_end: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct FileMeta {
     pub id: u32,
     pub path: PathBuf,
     pub lang: String,
-    /// Distinct fingerprint hash count for the file (denominator of Jaccard).
+    /// Distinct fingerprint hash count for the entry (denominator of Jaccard).
     pub unique_fps: u32,
+    /// Set on function-level entries; `None` for whole-file entries.
+    pub granule: Option<GranuleInfo>,
 }
 
 /// Inverted index keyed by fingerprint hash.
@@ -46,6 +57,9 @@ pub struct PairReport {
     pub a_total: u32,
     pub b_total: u32,
     pub jaccard: f32,
+    /// Set when the entry is a function-level granule.
+    pub granule_a: Option<GranuleInfo>,
+    pub granule_b: Option<GranuleInfo>,
 }
 
 impl Index {
@@ -61,8 +75,30 @@ impl Index {
         self.inverted.len()
     }
 
-    /// Add a file. Returns the assigned file id.
+    /// Add a whole-file entry. Returns the assigned id.
     pub fn add_file(&mut self, path: PathBuf, lang: &str, fps: &[Fingerprint]) -> u32 {
+        self.add_internal(path, lang.into(), None, fps)
+    }
+
+    /// Add a function-level granule. The granule's fingerprints come from slicing the
+    /// file's token stream by `granule.byte_range()` before fingerprinting.
+    pub fn add_granule(
+        &mut self,
+        path: PathBuf,
+        lang: &str,
+        granule: GranuleInfo,
+        fps: &[Fingerprint],
+    ) -> u32 {
+        self.add_internal(path, lang.into(), Some(granule), fps)
+    }
+
+    fn add_internal(
+        &mut self,
+        path: PathBuf,
+        lang: String,
+        granule: Option<GranuleInfo>,
+        fps: &[Fingerprint],
+    ) -> u32 {
         let id = self.files.len() as u32;
         let unique: HashSet<u64> = fps.iter().map(|f| f.hash).collect();
         let unique_count = unique.len() as u32;
@@ -72,8 +108,9 @@ impl Index {
         self.files.push(FileMeta {
             id,
             path,
-            lang: lang.into(),
+            lang,
             unique_fps: unique_count,
+            granule,
         });
         id
     }
@@ -121,6 +158,8 @@ impl Index {
                 a_total: meta_a.unique_fps,
                 b_total: meta_b.unique_fps,
                 jaccard,
+                granule_a: meta_a.granule.clone(),
+                granule_b: meta_b.granule.clone(),
             });
         }
         out
@@ -190,11 +229,34 @@ impl LshIndex {
         self.buckets.len()
     }
 
-    /// Register a file with its precomputed MinHash sketch and unique-fingerprint count.
+    /// Register a whole-file entry with its precomputed MinHash sketch.
     pub fn add_file(
         &mut self,
         path: PathBuf,
         lang: &str,
+        sketch: Sketch,
+        unique_fps: u32,
+    ) -> u32 {
+        self.add_internal(path, lang.into(), None, sketch, unique_fps)
+    }
+
+    /// Register a function-level granule with its precomputed MinHash sketch.
+    pub fn add_granule(
+        &mut self,
+        path: PathBuf,
+        lang: &str,
+        granule: GranuleInfo,
+        sketch: Sketch,
+        unique_fps: u32,
+    ) -> u32 {
+        self.add_internal(path, lang.into(), Some(granule), sketch, unique_fps)
+    }
+
+    fn add_internal(
+        &mut self,
+        path: PathBuf,
+        lang: String,
+        granule: Option<GranuleInfo>,
         sketch: Sketch,
         unique_fps: u32,
     ) -> u32 {
@@ -207,8 +269,9 @@ impl LshIndex {
         self.files.push(FileMeta {
             id,
             path,
-            lang: lang.into(),
+            lang,
             unique_fps,
+            granule,
         });
         id
     }
@@ -257,6 +320,8 @@ impl LshIndex {
                 a_total: meta_a.unique_fps,
                 b_total: meta_b.unique_fps,
                 jaccard: est,
+                granule_a: meta_a.granule.clone(),
+                granule_b: meta_b.granule.clone(),
             });
         }
         out
