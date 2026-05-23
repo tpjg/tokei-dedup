@@ -1708,6 +1708,7 @@ dependencies = [
  "tokei-dedup-engine",
  "tokio",
  "tower-lsp",
+ "xxhash-rust",
 ]
 
 [[package]]

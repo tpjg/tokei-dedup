@@ -72,5 +72,5 @@ The extension attaches `dupe-lsp` to: Rust, Python, JavaScript, TypeScript, Go, 
 
 ## Caveats
 
-- Save triggers a full workspace rescan (debounced 500 ms). For repos where the initial scan exceeds ~2 s, set `"rescanOnSave": false` in `initialization_options` and use `editor: restart language server` for a manual refresh.
-- True incremental re-fingerprinting (touch one file → update only that file's findings) is milestone-6 work; today every save re-scans the whole workspace.
+- Save / create / rename / delete trigger a debounced (500 ms) **incremental** update: only the changed files are re-fingerprinted. Save-to-feedback is sub-second on multi-MLOC workspaces. Fall back to the v0.1 full-rescan behavior with `"incremental": false`.
+- Editor differences around create / rename / delete events: Zed sends them. If a delete is somehow missed, the index keeps a stale entry until the file is touched again or you restart the LSP (`editor: restart language server`).
