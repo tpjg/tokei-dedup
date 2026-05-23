@@ -1,25 +1,13 @@
 [package]
-name = "tokei-dedup-cli"
+name = "tokei-dedup-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "tokei-dedup `dupe` CLI"
-
-[[bin]]
-name = "dupe"
-path = "src/main.rs"
+description = "tokei-dedup scan pipeline: walk → normalize → fingerprint → sketch → index → verify → classify"
 
 [dependencies]
-tokei-dedup-core = { workspace = true }
-tokei-dedup-classifier = { workspace = true }
-tokei-dedup-engine = { workspace = true }
-tokei-dedup-fingerprinter = { workspace = true }
-clap = { workspace = true }
-anyhow = { workspace = true }
-
-[dev-dependencies]
 tokei-dedup-core = { workspace = true }
 tokei-dedup-lang-config = { workspace = true }
 tokei-dedup-normalizer = { workspace = true }
@@ -28,5 +16,5 @@ tokei-dedup-index = { workspace = true }
 tokei-dedup-slicer = { workspace = true }
 tokei-dedup-verifier = { workspace = true }
 tokei-dedup-classifier = { workspace = true }
-tokei-dedup-engine = { workspace = true }
 walkdir = { workspace = true }
+rayon = { workspace = true }

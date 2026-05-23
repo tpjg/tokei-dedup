@@ -10,6 +10,7 @@ members = [
     "crates/verifier",
     "crates/classifier",
     "crates/semantic",
+    "crates/engine",
     "crates/cli",
     "crates/lsp-server",
 ]
@@ -31,6 +32,7 @@ tokei-dedup-index = { path = "crates/index", version = "0.0.1" }
 tokei-dedup-slicer = { path = "crates/slicer", version = "0.0.1" }
 tokei-dedup-verifier = { path = "crates/verifier", version = "0.0.1" }
 tokei-dedup-classifier = { path = "crates/classifier", version = "0.0.1" }
+tokei-dedup-engine = { path = "crates/engine", version = "0.0.1" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -40,6 +42,8 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 walkdir = "2"
 rayon = "1"
 clap = { version = "4", features = ["derive"] }
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync"] }
 
 [profile.release]
 lto = "thin"
