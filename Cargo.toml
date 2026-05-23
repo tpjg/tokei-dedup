@@ -14,6 +14,10 @@ members = [
     "crates/cli",
     "crates/lsp-server",
 ]
+# Zed extension is a WASM cdylib targeting `wasm32-wasip1`; Zed compiles it
+# on `zed: install dev extension`. Keeping it out of the host workspace
+# so `cargo build --workspace` doesn't try to build it for the host triple.
+exclude = ["editors/zed"]
 
 [workspace.package]
 version = "0.1.0"
