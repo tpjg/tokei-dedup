@@ -1235,6 +1235,7 @@ name = "tokei-dedup-index"
 version = "0.0.1"
 dependencies = [
  "tokei-dedup-fingerprinter",
+ "xxhash-rust",
 ]
 
 [[package]]

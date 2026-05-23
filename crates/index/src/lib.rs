@@ -1,16 +1,22 @@
-//! Naive inverted-index over fingerprint hashes.
+//! Index backends for candidate-pair retrieval.
 //!
-//! Milestone 1 strategy: bucket fingerprints by hash, then for each bucket count file
-//! pairs co-occurring. Files sharing many fingerprints are candidate clones.
+//! Two implementations are provided:
 //!
-//! Cost: `O(sum_over_buckets size^2)`. A "popular" hash (boilerplate `import os` shows up
-//! in every file) explodes one bucket into `N^2/2` pairs. The `max_bucket_size` cap
-//! filters that — boilerplate-class hashes are skipped entirely. LSH (milestone 2) makes
-//! this sub-linear.
+//! - [`Index`] — naive inverted index over fingerprint hashes. Exact, simple, but pair
+//!   enumeration is `O(sum bucket_size^2)`; needs the `max_bucket_size` cap to keep
+//!   boilerplate hashes from exploding. Useful for small corpora and as an oracle.
+//! - [`LshIndex`] — banded MinHash LSH. Each file contributes one bucket entry per band
+//!   (default 32 bands × 4 rows over a 128-slot sketch). Candidate retrieval is
+//!   sub-linear in `N` because most files never collide in any band.
+//!
+//! Both backends produce the same [`PairReport`] shape — `jaccard` is exact for `Index`
+//! and an unbiased estimate (±~4 % stddev with 128 slots) for `LshIndex`. The estimated
+//! `shared` count for LSH is derived from `jaccard * (a + b) / (1 + jaccard)`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use tokei_dedup_fingerprinter::Fingerprint;
+use tokei_dedup_fingerprinter::{jaccard_from_sketches, Fingerprint, Sketch, SIGNATURE_SIZE};
+use xxhash_rust::xxh3::Xxh3;
 
 #[derive(Debug, Clone)]
 pub struct FileMeta {
@@ -133,6 +139,158 @@ impl Index {
     }
 }
 
+// --- LSH backend ----------------------------------------------------------------------
+
+/// Banded LSH over MinHash sketches.
+///
+/// Two sketches that agree on at least one band become a candidate pair. With `bands=b`
+/// and `rows=r`, the probability that a pair with true Jaccard `s` is caught is
+/// `1 - (1 - s^r)^b`. Defaults `b=32, r=4` give an S-curve centered around `j ≈ 0.42`:
+/// pairs with `j ≥ 0.6` are essentially always retrieved; pairs with `j ≤ 0.2` are rarely
+/// retrieved.
+pub struct LshIndex {
+    bands: usize,
+    rows: usize,
+    files: Vec<FileMeta>,
+    sketches: Vec<Sketch>,
+    /// `xxh3(band_idx || band_slice) → file_ids`. A file appears at most once per band
+    /// here (we don't add the same file twice).
+    buckets: HashMap<u64, Vec<u32>>,
+}
+
+pub const DEFAULT_LSH_BANDS: usize = 32;
+pub const DEFAULT_LSH_ROWS: usize = 4;
+
+impl LshIndex {
+    /// `bands * rows` must equal [`tokei_dedup_fingerprinter::SIGNATURE_SIZE`].
+    pub fn new(bands: usize, rows: usize) -> Self {
+        assert_eq!(
+            bands * rows,
+            SIGNATURE_SIZE,
+            "bands*rows must equal SIGNATURE_SIZE ({SIGNATURE_SIZE})"
+        );
+        Self {
+            bands,
+            rows,
+            files: Vec::new(),
+            sketches: Vec::new(),
+            buckets: HashMap::new(),
+        }
+    }
+
+    pub fn with_defaults() -> Self {
+        Self::new(DEFAULT_LSH_BANDS, DEFAULT_LSH_ROWS)
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    pub fn bucket_count(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// Register a file with its precomputed MinHash sketch and unique-fingerprint count.
+    pub fn add_file(
+        &mut self,
+        path: PathBuf,
+        lang: &str,
+        sketch: Sketch,
+        unique_fps: u32,
+    ) -> u32 {
+        let id = self.files.len() as u32;
+        for band in 0..self.bands {
+            let key = band_hash(&sketch, band, self.rows);
+            self.buckets.entry(key).or_default().push(id);
+        }
+        self.sketches.push(sketch);
+        self.files.push(FileMeta {
+            id,
+            path,
+            lang: lang.into(),
+            unique_fps,
+        });
+        id
+    }
+
+    /// Walk buckets, collect candidate pairs, then refine via full-sketch Jaccard
+    /// estimate. Returns pairs with estimated Jaccard `>= min_jaccard`.
+    pub fn pair_report(&self, min_jaccard: f32) -> Vec<PairReport> {
+        let mut candidates: HashSet<(u32, u32)> = HashSet::new();
+        for files in self.buckets.values() {
+            if files.len() < 2 {
+                continue;
+            }
+            // Sort + dedup defensively in case the same file landed twice in a bucket
+            // (cross-band collision — exceedingly rare with xxh3).
+            let mut sorted = files.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            for i in 0..sorted.len() {
+                for j in (i + 1)..sorted.len() {
+                    candidates.insert((sorted[i], sorted[j]));
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(candidates.len());
+        for (a, b) in candidates {
+            let est = jaccard_from_sketches(&self.sketches[a as usize], &self.sketches[b as usize]);
+            if est < min_jaccard {
+                continue;
+            }
+            let meta_a = &self.files[a as usize];
+            let meta_b = &self.files[b as usize];
+            let sum = meta_a.unique_fps as f32 + meta_b.unique_fps as f32;
+            // Invert jaccard = shared / (a + b - shared) → shared = j(a+b) / (1 + j).
+            let shared_est = if est > 0.0 {
+                (est * sum / (1.0 + est)).round() as u32
+            } else {
+                0
+            };
+            out.push(PairReport {
+                file_a: meta_a.path.clone(),
+                file_b: meta_b.path.clone(),
+                lang_a: meta_a.lang.clone(),
+                lang_b: meta_b.lang.clone(),
+                shared: shared_est,
+                a_total: meta_a.unique_fps,
+                b_total: meta_b.unique_fps,
+                jaccard: est,
+            });
+        }
+        out
+    }
+
+    pub fn candidate_pair_count(&self) -> usize {
+        let mut candidates: HashSet<(u32, u32)> = HashSet::new();
+        for files in self.buckets.values() {
+            if files.len() < 2 {
+                continue;
+            }
+            let mut sorted = files.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            for i in 0..sorted.len() {
+                for j in (i + 1)..sorted.len() {
+                    candidates.insert((sorted[i], sorted[j]));
+                }
+            }
+        }
+        candidates.len()
+    }
+}
+
+fn band_hash(sketch: &Sketch, band: usize, rows: usize) -> u64 {
+    let mut h = Xxh3::new();
+    h.update(&(band as u64).to_le_bytes());
+    let start = band * rows;
+    for slot in &sketch[start..start + rows] {
+        h.update(&slot.to_le_bytes());
+    }
+    h.digest()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +348,93 @@ mod tests {
         assert!(idx.pair_report(1, 2).is_empty());
         // With cap=10 we get all 3 pairs.
         assert_eq!(idx.pair_report(1, 10).len(), 3);
+    }
+
+    // --- LSH tests ----------------------------------------------------------------
+
+    use tokei_dedup_fingerprinter::{MinHasher, DEFAULT_MINHASH_SEED};
+
+    fn sketch_of(set: &[u64]) -> Sketch {
+        let mh = MinHasher::new(DEFAULT_MINHASH_SEED);
+        mh.sketch(set)
+    }
+
+    #[test]
+    fn lsh_panics_on_bad_band_row_product() {
+        let result = std::panic::catch_unwind(|| LshIndex::new(7, 7));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn lsh_identical_sketches_pair() {
+        let mut idx = LshIndex::with_defaults();
+        let set: Vec<u64> = (0..200).collect();
+        let s = sketch_of(&set);
+        idx.add_file("a.rs".into(), "Rust", s, 200);
+        idx.add_file("b.rs".into(), "Rust", s, 200);
+        let pairs = idx.pair_report(0.5);
+        assert_eq!(pairs.len(), 1);
+        assert!(pairs[0].jaccard > 0.99);
+    }
+
+    #[test]
+    fn lsh_disjoint_sketches_do_not_pair() {
+        let mut idx = LshIndex::with_defaults();
+        let a: Vec<u64> = (0..200).collect();
+        let b: Vec<u64> = (10_000..10_200).collect();
+        idx.add_file("a.rs".into(), "Rust", sketch_of(&a), 200);
+        idx.add_file("b.rs".into(), "Rust", sketch_of(&b), 200);
+        let pairs = idx.pair_report(0.3);
+        // Either no candidate generated at all, or candidate filtered by jaccard threshold.
+        assert!(pairs.is_empty(), "disjoint sets should not pair, got {pairs:?}");
+    }
+
+    #[test]
+    fn lsh_high_overlap_pairs_correctly() {
+        // True Jaccard ≈ 100 / (200 + 200 - 100) = 0.33 — below default LSH curve
+        // midpoint, may or may not be retrieved. Build a clearer case: 90% overlap.
+        let mut idx = LshIndex::with_defaults();
+        let common: Vec<u64> = (0..180).collect();
+        let mut a = common.clone();
+        a.extend(180..200);
+        let mut b = common.clone();
+        b.extend(200..220);
+        idx.add_file("a.rs".into(), "Rust", sketch_of(&a), a.len() as u32);
+        idx.add_file("b.rs".into(), "Rust", sketch_of(&b), b.len() as u32);
+        let pairs = idx.pair_report(0.5);
+        assert_eq!(pairs.len(), 1);
+        // True Jaccard = 180 / 220 ≈ 0.818. Estimate should be in the ballpark.
+        assert!(
+            pairs[0].jaccard > 0.7,
+            "expected high-overlap pair, got {:.3}",
+            pairs[0].jaccard
+        );
+    }
+
+    #[test]
+    fn lsh_scales_to_many_files() {
+        // 1000 unrelated files plus 1 cloned pair — pair must surface, candidate count
+        // must stay far below O(N^2/2) = 500K.
+        let mut idx = LshIndex::with_defaults();
+        for i in 0..1000 {
+            let set: Vec<u64> = (i * 1000..i * 1000 + 200).collect();
+            idx.add_file(format!("f{i}.rs").into(), "Rust", sketch_of(&set), 200);
+        }
+        let clone_set: Vec<u64> = (0..200).collect(); // identical to file 0
+        idx.add_file("clone.rs".into(), "Rust", sketch_of(&clone_set), 200);
+        let candidates = idx.candidate_pair_count();
+        let pairs = idx.pair_report(0.5);
+        assert!(
+            candidates < 5_000,
+            "expected sub-linear candidate set, got {candidates}"
+        );
+        assert!(
+            pairs.iter().any(|p| {
+                let a = p.file_a.to_string_lossy();
+                let b = p.file_b.to_string_lossy();
+                (a == "f0.rs" && b == "clone.rs") || (a == "clone.rs" && b == "f0.rs")
+            }),
+            "expected the clone-of-f0 pair to surface; got {pairs:?}"
+        );
     }
 }
