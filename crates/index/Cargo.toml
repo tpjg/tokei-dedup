@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "tokei-dedup index stage (stub — see DESIGN.md)"
+description = "Inverted-index over fingerprint hashes; reports candidate duplicate file pairs"
 
 [dependencies]
+tokei-dedup-fingerprinter = { workspace = true }
