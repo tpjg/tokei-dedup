@@ -13,16 +13,10 @@ path = "src/main.rs"
 
 [dependencies]
 tokei-dedup-core = { workspace = true }
-tokei-dedup-lang-config = { workspace = true }
-tokei-dedup-normalizer = { workspace = true }
-tokei-dedup-fingerprinter = { workspace = true }
-tokei-dedup-index = { workspace = true }
-tokei-dedup-slicer = { workspace = true }
-tokei-dedup-verifier = { workspace = true }
 tokei-dedup-classifier = { workspace = true }
+tokei-dedup-engine = { workspace = true }
+tokei-dedup-fingerprinter = { workspace = true }
 clap = { workspace = true }
-walkdir = { workspace = true }
-rayon = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
@@ -34,4 +28,5 @@ tokei-dedup-index = { workspace = true }
 tokei-dedup-slicer = { workspace = true }
 tokei-dedup-verifier = { workspace = true }
 tokei-dedup-classifier = { workspace = true }
+tokei-dedup-engine = { workspace = true }
 walkdir = { workspace = true }
