@@ -214,6 +214,28 @@ struct Item {
 /// `OverrideBuilder` reads `!pat` as "blacklist," and when *every* override is a
 /// blacklist (the case here) non-matching paths are included normally.
 pub fn walk_filtered(workspace: &Path, opts: &WalkOptions) -> Vec<PathBuf> {
+    configured_walker(workspace, opts)
+        .build()
+        .filter_map(|r| r.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| e.into_path())
+        .collect()
+}
+
+/// Same exclude/gitignore rules as [`walk_filtered`], but yields directories
+/// instead of files. Used by the LSP's file watcher to register per-dir
+/// non-recursive notify watches — directories that don't match the include
+/// set are never watched at all (no syscall, no inotify slot consumed).
+pub fn walk_filtered_dirs(workspace: &Path, opts: &WalkOptions) -> Vec<PathBuf> {
+    configured_walker(workspace, opts)
+        .build()
+        .filter_map(|r| r.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.into_path())
+        .collect()
+}
+
+fn configured_walker(workspace: &Path, opts: &WalkOptions) -> WalkBuilder {
     let mut builder = WalkBuilder::new(workspace);
     builder.standard_filters(opts.respect_gitignore);
 
@@ -242,11 +264,6 @@ pub fn walk_filtered(workspace: &Path, opts: &WalkOptions) -> Vec<PathBuf> {
     }
 
     builder
-        .build()
-        .filter_map(|r| r.ok())
-        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-        .map(|e| e.into_path())
-        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]

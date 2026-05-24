@@ -140,12 +140,12 @@ Diagnostics are tiered by score: the top 20 findings (configurable) get `WARNING
 
 ### Configuration (`initializationOptions`)
 
-The defaults are intentionally strict — function-granularity, aggressive blinding, Jaccard floor of **0.8**, top-20 highlighted, rescan on save. Widen via standard LSP `initializationOptions`:
+Defaults: function-granularity, mild blinding, Jaccard floor of **0.8**, top-20 highlighted, rescan on save. Widen via standard LSP `initializationOptions`:
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `granularity` | `"file" \| "function"` | `"function"` | Coarser file-mode is faster but noisier |
-| `blind` | `"strict" \| "mild" \| "aggressive"` | `"aggressive"` | `aggressive` catches renamed Type-2 clones |
+| `blind` | `"strict" \| "mild" \| "aggressive"` | `"mild"` | `aggressive` additionally blinds identifiers (catches renamed Type-2 clones), but produces more index entries and is **noticeably slower on large repos** — opt in per workspace |
 | `minJaccard` | number in `[0, 1]` | `0.8` | Lower → more findings, more false positives |
 | `exclude` | string[] | `[]` | Gitignore-style globs added on top of the built-in excludes |
 | `highlightTop` | integer | `20` | Findings ranked 1..N (by score) get the highlight severity |
@@ -153,6 +153,7 @@ The defaults are intentionally strict — function-granularity, aggressive blind
 | `tailSeverity` | `"hint" \| "information" \| "warning" \| "off"` | `"hint"` | Severity for findings outside the top; `"off"` drops them entirely |
 | `rescanOnSave` | boolean | `true` | Re-process the workspace on every save (debounced 500 ms). Turn off if you'd rather restart the LSP manually |
 | `incremental` | boolean | `true` | Use the incremental engine (M6): re-fingerprint only changed files. Set `false` to fall back to a full workspace rescan on every save — same behavior as v0.1.0 |
+| `fileWatch` | boolean | `false` | Also watch the filesystem (notify / FSEvents / inotify) for changes made outside the editor. **Turn on when the tree can change without an editor save** — CLI tools, AI assistants (Claude, Aider, Cursor agents), `git checkout`, formatters run from a terminal. Excluded directories are never watched |
 
 Unknown keys are tolerated (forward-compat); malformed values produce a `WARNING` log on the client and fall back to defaults.
 

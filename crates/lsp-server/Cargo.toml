@@ -19,3 +19,4 @@ tokio = { workspace = true, features = ["time"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 xxhash-rust = { workspace = true }
+notify = { workspace = true }
