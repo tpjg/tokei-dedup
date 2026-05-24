@@ -25,6 +25,9 @@
 //! The server runs over stdio (LSP convention): editor pipes `--stdio`, the
 //! server reads JSON-RPC frames from stdin and writes to stdout.
 
+mod file_watcher;
+
+use file_watcher::FileWatcher;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -69,6 +72,10 @@ struct InitOptions {
     /// scan — the v1 fallback, useful if incremental ever misbehaves on a
     /// particular workspace.
     incremental: Option<bool>,
+    /// Watch the filesystem for changes made outside the editor (CLI tools,
+    /// AI assistants, git operations). Opt-in for now; default `false`.
+    /// Excluded directories are never watched.
+    file_watch: Option<bool>,
 }
 
 /// Resolved diagnostic-publishing policy.
@@ -87,6 +94,9 @@ struct PublishOptions {
     /// `did_delete_files` go through the incremental engine. When `false`,
     /// every rescan is a full workspace scan.
     incremental: bool,
+    /// Whether the LSP also runs a filesystem watcher (notify) in parallel
+    /// with editor save events. Catches changes made outside the editor.
+    file_watch: bool,
 }
 
 fn default_publish_opts() -> PublishOptions {
@@ -101,6 +111,9 @@ fn default_publish_opts() -> PublishOptions {
         tail_severity: Some(DiagnosticSeverity::HINT),
         rescan_on_save: true,
         incremental: true,
+        // Opt-in until the watcher has soaked on real workspaces. Flip
+        // to `true` once it's been validated.
+        file_watch: false,
     }
 }
 
@@ -129,6 +142,10 @@ struct DupeServer {
     /// Set once when `initialized` spawns the rescan loop so the spawn itself
     /// is idempotent.
     rescan_loop_started: AtomicBool,
+    /// Live filesystem watcher (if enabled via `fileWatch`). `None` until
+    /// `initialized` builds it. Held here so dropping the server drops the
+    /// notify subscriptions.
+    file_watcher: Arc<SyncMutex<Option<FileWatcher>>>,
 }
 
 #[derive(Default)]
@@ -226,6 +243,9 @@ impl LanguageServer for DupeServer {
         // Kick the loop in case saves accumulated in pending_paths during the
         // scan.
         self.rescan_notify.notify_one();
+        // Engine is ready; the rescan loop is consuming. Safe to start
+        // the fs watcher (if enabled) without losing events.
+        self.maybe_spawn_file_watcher().await;
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -322,6 +342,54 @@ impl DupeServer {
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, None)
             .await;
+    }
+
+    /// If `fileWatch` is enabled, register notify watches on every allowed
+    /// directory and route events into `pending_paths`. Excluded dirs are
+    /// skipped entirely (no watch, no syscall). Called from `initialized`
+    /// after the engine is built and the rescan loop is consuming.
+    async fn maybe_spawn_file_watcher(&self) {
+        let (root, walk_opts, enabled) = {
+            let s = self.state.lock().await;
+            let enabled = s
+                .publish_opts
+                .as_ref()
+                .map(|p| p.file_watch)
+                .unwrap_or(false);
+            (s.workspace_root.clone(), s.scan_opts.walk.clone(), enabled)
+        };
+        if !enabled {
+            return;
+        }
+        let Some(root) = root else {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    "dupe-lsp: fileWatch enabled but no workspace root; skipping",
+                )
+                .await;
+            return;
+        };
+        match FileWatcher::spawn(
+            root,
+            walk_opts,
+            self.pending_paths.clone(),
+            self.rescan_notify.clone(),
+            self.client.clone(),
+        ) {
+            Ok(fw) => {
+                let mut guard = self.file_watcher.lock().unwrap();
+                *guard = Some(fw);
+            }
+            Err(e) => {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("dupe-lsp: file watcher failed to start: {e}"),
+                    )
+                    .await;
+            }
+        }
     }
 
     /// Enqueue paths into the pending set and notify the rescan loop.
@@ -719,12 +787,13 @@ fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
     None
 }
 
-/// Intentionally strict baseline: function-granularity, aggressive blinding,
-/// Jaccard floor 0.8. Users widen via config when they want recall over
-/// precision.
+/// Defaults: function-granularity, mild blinding (literals only),
+/// Jaccard floor 0.8. Matches the CLI's defaults except for granularity.
+/// Users can opt up to `"aggressive"` for renamed Type-2 clone detection,
+/// at the cost of larger indexes and slower scans on big repos.
 fn default_scan_opts() -> ScanOptions {
     ScanOptions {
-        blind: BlindModeExt::Aggressive,
+        blind: BlindModeExt::Mild,
         granularity: Granularity::Function,
         min_jaccard: 0.8,
         ..ScanOptions::default()
@@ -813,6 +882,9 @@ fn resolve_init_opts(
     }
     if let Some(b) = parsed.incremental {
         pub_opts.incremental = b;
+    }
+    if let Some(b) = parsed.file_watch {
+        pub_opts.file_watch = b;
     }
     (scan_opts, pub_opts, warnings)
 }
@@ -972,11 +1044,11 @@ mod tests {
     use tokei_dedup_classifier::{GranuleRef, ItemRef, Tag};
 
     #[test]
-    fn scan_defaults_are_intentionally_strict() {
+    fn scan_defaults_match_documented() {
         let (opts, _pub, warns) = resolve_init_opts(None);
         assert!(warns.is_empty());
         assert_eq!(opts.granularity, Granularity::Function);
-        assert!(matches!(opts.blind, BlindModeExt::Aggressive));
+        assert!(matches!(opts.blind, BlindModeExt::Mild));
         assert!((opts.min_jaccard - 0.8).abs() < f32::EPSILON);
         assert!(opts.walk.custom_excludes.is_empty());
     }
@@ -1025,6 +1097,7 @@ mod tests {
             "highlightSeverity": "warning",
             "tailSeverity": "information",
             "rescanOnSave": false,
+            "fileWatch": true,
         });
         let (_scan, pub_opts, warns) = resolve_init_opts(Some(&raw));
         assert!(warns.is_empty(), "got {warns:?}");
@@ -1032,6 +1105,13 @@ mod tests {
         assert_eq!(pub_opts.highlight_severity, DiagnosticSeverity::WARNING);
         assert_eq!(pub_opts.tail_severity, Some(DiagnosticSeverity::INFORMATION));
         assert!(!pub_opts.rescan_on_save);
+        assert!(pub_opts.file_watch);
+    }
+
+    #[test]
+    fn file_watch_defaults_off() {
+        let (_scan, pub_opts, _warns) = resolve_init_opts(None);
+        assert!(!pub_opts.file_watch);
     }
 
     #[test]
@@ -1164,6 +1244,7 @@ mod tests {
             tail_severity: None,
             rescan_on_save: true,
             incremental: true,
+            file_watch: false,
         };
         let map = rank_and_group(findings, &pub_opts);
         let total: usize = map.values().map(|v| v.len()).sum();
@@ -1193,6 +1274,7 @@ async fn main() {
         pending_paths: Arc::new(Mutex::new(HashSet::new())),
         rescan_notify: Arc::new(Notify::new()),
         rescan_loop_started: AtomicBool::new(false),
+        file_watcher: Arc::new(SyncMutex::new(None)),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
