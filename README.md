@@ -2,16 +2,16 @@
 
 Language-agnostic duplicate code detection, built on a [tokei](https://github.com/XAMPPRocky/tokei)-style single-pass FSM tokenizer.
 
-**Status: pre-alpha, through milestone 5.** Whole-pipeline scan (332-language tokenizer → winnowing fingerprints → MinHash + banded LSH → tree-sitter function slicing for Rust/Python/JS/Go → exact-Jaccard verifier → heuristic classifier → HTML/JSON/terminal report) plus a basic LSP server. See [`DESIGN.md`](./DESIGN.md) for the architecture and full roadmap.
+**Status: beta, through milestone 6.** Whole-pipeline scan (332-language tokenizer → winnowing fingerprints → MinHash + banded LSH → tree-sitter function slicing for 11 languages → exact-Jaccard verifier → heuristic classifier → HTML/JSON/terminal report) plus a configurable LSP server with incremental re-indexing on save / create / rename / delete. See [`DESIGN.md`](./DESIGN.md) for the architecture and full roadmap.
 
 ## What it is
 
 A pipeline that takes a directory of source code, normalizes it through a fast byte-level state machine (driven by tokei's vendored language definitions), and detects duplicate code at two granularities:
 
-- **Whole-function duplicates** (Type 1–3 clones, via tree-sitter slicing today; AST-shape hashing planned in milestone 6)
+- **Whole-function duplicates** (Type 1–3 clones via tree-sitter slicing for 11 languages; AST-shape hashing is on the longer-term roadmap)
 - **Whole-file duplicates** (winnowing over the file's token stream)
 
-No LLM in the loop. ~1500-file Python repo: end-to-end in well under a second.
+No LLM in the loop. ~1500-file Python repo: end-to-end in well under a second; a 343k-LOC Rust+Gleam repo: under a second. Linux-kernel-scale (~30M LOC): around 20 s — but the LSP's incremental updates keep save-to-feedback sub-second regardless of repo size.
 
 ## Why
 
@@ -58,7 +58,7 @@ Most common invocations:
 # Whole-file mode, fast first pass
 dupe scan src/
 
-# Per-function clones — needs tree-sitter (Rust/Python/JS/Go currently)
+# Per-function clones — needs tree-sitter (11 languages, see Language support below)
 dupe scan src/ --granularity function --blind aggressive --min-jaccard 0.7
 
 # Render an HTML report alongside terminal output
@@ -283,12 +283,14 @@ Two layers:
 | 0 | Scaffold + tokei-equivalent FSM, cross-validated | ✓ |
 | 1 | Winnowing fingerprints + naive index | ✓ |
 | 2 | MinHash + banded LSH | ✓ |
-| 3 | Tree-sitter function slicing (4 langs) | ✓ |
+| 3 | Tree-sitter function slicing (11 langs) | ✓ |
 | 4 | Verifier + classifier + HTML report | ✓ |
-| 5 | LSP server (first cut) | ✓ |
-| 6 | Incremental re-indexing, watch mode | — |
+| 5 | LSP server, configurable via `initializationOptions`, Zed extension | ✓ |
+| 6 | Incremental re-indexing (LSH tombstoning, per-path engine update, debounced workspace events) | ✓ |
 | 7 | Upstream `Visitor` PR to tokei | — |
 | 8 | Semantic enrichment via LSP | — |
+
+A `dupe watch` CLI was considered and explicitly dropped from M6: at the scale where a daemon would matter, a one-shot `dupe scan` already finishes (~20 s on the Linux kernel) faster than a human can digest the report. The LSP covers the editor case.
 
 ## License
 
