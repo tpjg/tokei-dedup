@@ -288,10 +288,6 @@ Two layers:
 | 4 | Verifier + classifier + HTML report | ✓ |
 | 5 | LSP server, configurable via `initializationOptions`, Zed extension | ✓ |
 | 6 | Incremental re-indexing (LSH tombstoning, per-path engine update, debounced workspace events) | ✓ |
-| 7 | Upstream `Visitor` PR to tokei | — |
-| 8 | Semantic enrichment via LSP | — |
-
-A `dupe watch` CLI was considered and explicitly dropped from M6: at the scale where a daemon would matter, a one-shot `dupe scan` already finishes (~20 s on the Linux kernel) faster than a human can digest the report. The LSP covers the editor case.
 
 ## License
 
