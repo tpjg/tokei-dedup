@@ -14,17 +14,17 @@
 //! `shared` count for LSH is derived from `jaccard * (a + b) / (1 + jaccard)`.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokei_dedup_fingerprinter::{jaccard_from_sketches, Fingerprint, Sketch, SIGNATURE_SIZE};
 use xxhash_rust::xxh3::Xxh3;
 
 /// Sub-file region metadata. Carried alongside path/lang for function-level entries
 /// (milestone 3+). `None` on a `FileMeta` means the entry is the whole file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GranuleInfo {
-    pub fn_name: Option<String>,
     pub line_start: u32,
     pub line_end: u32,
+    pub fn_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +36,9 @@ pub struct FileMeta {
     pub unique_fps: u32,
     /// Set on function-level entries; `None` for whole-file entries.
     pub granule: Option<GranuleInfo>,
+    /// Tombstone flag for incremental updates ([`LshIndex::remove_by_path`]).
+    /// The naive [`Index`] never flips this and treats every entry as alive.
+    pub alive: bool,
 }
 
 /// Inverted index keyed by fingerprint hash.
@@ -111,6 +114,7 @@ impl Index {
             lang,
             unique_fps: unique_count,
             granule,
+            alive: true,
         });
         id
     }
@@ -193,8 +197,15 @@ pub struct LshIndex {
     files: Vec<FileMeta>,
     sketches: Vec<Sketch>,
     /// `xxh3(band_idx || band_slice) → file_ids`. A file appears at most once per band
-    /// here (we don't add the same file twice).
+    /// here (we don't add the same file twice). Entries for tombstoned files stay in
+    /// the buckets until [`compact`](Self::compact) runs — readers skip dead IDs.
     buckets: HashMap<u64, Vec<u32>>,
+    /// `path → currently-live IDs at that path`. Lets [`remove_by_path`](Self::remove_by_path)
+    /// tombstone all granules of a file in O(granule_count). Cleared for a path on
+    /// removal so a re-add registers fresh IDs without colliding with the old set.
+    path_to_ids: HashMap<PathBuf, Vec<u32>>,
+    /// Count of entries with `alive == false`. Drives the lazy-compaction trigger.
+    tombstoned: usize,
 }
 
 pub const DEFAULT_LSH_BANDS: usize = 32;
@@ -214,6 +225,8 @@ impl LshIndex {
             files: Vec::new(),
             sketches: Vec::new(),
             buckets: HashMap::new(),
+            path_to_ids: HashMap::new(),
+            tombstoned: 0,
         }
     }
 
@@ -221,12 +234,49 @@ impl LshIndex {
         Self::new(DEFAULT_LSH_BANDS, DEFAULT_LSH_ROWS)
     }
 
+    /// Number of currently-alive entries. Tombstoned entries do not count.
     pub fn file_count(&self) -> usize {
+        self.files.len() - self.tombstoned
+    }
+
+    /// Total entries including tombstoned ones (the raw vector length). Useful for
+    /// diagnostics around compaction; user-facing counts should prefer
+    /// [`file_count`](Self::file_count).
+    pub fn total_entries(&self) -> usize {
         self.files.len()
     }
 
     pub fn bucket_count(&self) -> usize {
         self.buckets.len()
+    }
+
+    /// Ratio of tombstoned to total entries. Used to decide when to
+    /// [`compact`](Self::compact); 0.0 immediately after a fresh build or compaction.
+    pub fn tombstone_ratio(&self) -> f32 {
+        if self.files.is_empty() {
+            0.0
+        } else {
+            self.tombstoned as f32 / self.files.len() as f32
+        }
+    }
+
+    /// Whether `id` is still alive (i.e. not tombstoned). Out-of-range IDs are
+    /// considered dead.
+    pub fn is_alive(&self, id: u32) -> bool {
+        self.files
+            .get(id as usize)
+            .map(|m| m.alive)
+            .unwrap_or(false)
+    }
+
+    /// Currently-live IDs that belong to `path` (one entry per granule in
+    /// function mode, one entry in file mode). Returns empty if the path
+    /// isn't in the index. Useful before calling
+    /// [`remove_by_path`](Self::remove_by_path) — the engine layer captures
+    /// these so it can enumerate "what pairs are about to be invalidated"
+    /// before tombstoning kicks in.
+    pub fn ids_for_path(&self, path: &Path) -> Vec<u32> {
+        self.path_to_ids.get(path).cloned().unwrap_or_default()
     }
 
     /// Register a whole-file entry with its precomputed MinHash sketch.
@@ -266,27 +316,137 @@ impl LshIndex {
             self.buckets.entry(key).or_default().push(id);
         }
         self.sketches.push(sketch);
+        self.path_to_ids.entry(path.clone()).or_default().push(id);
         self.files.push(FileMeta {
             id,
             path,
             lang,
             unique_fps,
             granule,
+            alive: true,
         });
         id
     }
 
+    /// Tombstone every entry whose path equals `path` and return the affected IDs.
+    ///
+    /// IDs and band-bucket entries stay in place — readers (`pair_report`,
+    /// `candidate_pairs`, `partners_of`) skip dead IDs. This is O(granule_count)
+    /// for the path. Call [`compact`](Self::compact) when [`tombstone_ratio`](Self::tombstone_ratio)
+    /// grows too large.
+    ///
+    /// Returned IDs remain queryable via [`partners_of`](Self::partners_of) until
+    /// the next compaction — this is intentional, so the engine layer can enumerate
+    /// "what pairs would this (now-removed) entry have been in" after the call.
+    pub fn remove_by_path(&mut self, path: &Path) -> Vec<u32> {
+        let ids = self.path_to_ids.remove(path).unwrap_or_default();
+        for &id in &ids {
+            if let Some(meta) = self.files.get_mut(id as usize) {
+                if meta.alive {
+                    meta.alive = false;
+                    self.tombstoned += 1;
+                }
+            }
+        }
+        ids
+    }
+
+    /// Live partners of `id` together with the sketch-Jaccard estimate.
+    ///
+    /// Walks the band buckets `id` participates in, collects every other ID sharing
+    /// any band, filters to live entries, and computes the sketch-Jaccard estimate
+    /// against `id`'s own sketch. The result is deduplicated across bands.
+    ///
+    /// Works on tombstoned `id`s too: their bucket entries are still in place, so
+    /// you can ask "before I committed this removal, which live partners would this
+    /// have paired with?". Dead-dead pairs are not returned because the partner
+    /// must be alive.
+    pub fn partners_of(&self, id: u32) -> Vec<(u32, f32)> {
+        let Some(my_sketch) = self.sketches.get(id as usize) else {
+            return Vec::new();
+        };
+        let mut seen: HashSet<u32> = HashSet::new();
+        for band in 0..self.bands {
+            let key = band_hash(my_sketch, band, self.rows);
+            let Some(bucket) = self.buckets.get(&key) else {
+                continue;
+            };
+            for &other in bucket {
+                if other == id {
+                    continue;
+                }
+                if !self.is_alive(other) {
+                    continue;
+                }
+                seen.insert(other);
+            }
+        }
+        seen.into_iter()
+            .map(|other| {
+                let est = jaccard_from_sketches(my_sketch, &self.sketches[other as usize]);
+                (other, est)
+            })
+            .collect()
+    }
+
+    /// Drop tombstoned entries from the underlying vectors, reassign IDs to be
+    /// contiguous, and rebuild buckets / path map. After this returns,
+    /// [`tombstone_ratio`](Self::tombstone_ratio) is zero and every live entry has a
+    /// fresh (typically smaller) ID.
+    ///
+    /// IDs are not stable across this call — callers that hold IDs must capture them
+    /// before compaction or rebuild their own mapping afterwards. The engine layer
+    /// drives compaction on its own cadence (after publishing an update) so the LSP
+    /// caller never sees an ID change mid-request.
+    pub fn compact(&mut self) {
+        if self.tombstoned == 0 {
+            return;
+        }
+        let mut new_files: Vec<FileMeta> = Vec::with_capacity(self.file_count());
+        let mut new_sketches: Vec<Sketch> = Vec::with_capacity(self.file_count());
+        let mut new_path_to_ids: HashMap<PathBuf, Vec<u32>> = HashMap::new();
+        let mut new_buckets: HashMap<u64, Vec<u32>> = HashMap::new();
+
+        for (old_idx, meta) in self.files.iter().enumerate() {
+            if !meta.alive {
+                continue;
+            }
+            let new_id = new_files.len() as u32;
+            let sketch = self.sketches[old_idx];
+            for band in 0..self.bands {
+                let key = band_hash(&sketch, band, self.rows);
+                new_buckets.entry(key).or_default().push(new_id);
+            }
+            new_sketches.push(sketch);
+            new_path_to_ids
+                .entry(meta.path.clone())
+                .or_default()
+                .push(new_id);
+            let mut renumbered = meta.clone();
+            renumbered.id = new_id;
+            new_files.push(renumbered);
+        }
+
+        self.files = new_files;
+        self.sketches = new_sketches;
+        self.path_to_ids = new_path_to_ids;
+        self.buckets = new_buckets;
+        self.tombstoned = 0;
+    }
+
     /// Walk buckets, collect candidate pairs, then refine via full-sketch Jaccard
-    /// estimate. Returns pairs with estimated Jaccard `>= min_jaccard`.
+    /// estimate. Returns pairs with estimated Jaccard `>= min_jaccard`. Dead IDs
+    /// (tombstoned via [`remove_by_path`](Self::remove_by_path)) are skipped.
     pub fn pair_report(&self, min_jaccard: f32) -> Vec<PairReport> {
         let mut candidates: HashSet<(u32, u32)> = HashSet::new();
         for files in self.buckets.values() {
-            if files.len() < 2 {
+            // Filter dead IDs out before counting; a bucket with one live entry
+            // and several tombstones still has no pairs.
+            let mut sorted: Vec<u32> =
+                files.iter().copied().filter(|id| self.is_alive(*id)).collect();
+            if sorted.len() < 2 {
                 continue;
             }
-            // Sort + dedup defensively in case the same file landed twice in a bucket
-            // (cross-band collision — exceedingly rare with xxh3).
-            let mut sorted = files.clone();
             sorted.sort_unstable();
             sorted.dedup();
             for i in 0..sorted.len() {
@@ -355,10 +515,11 @@ impl LshIndex {
     fn candidate_pairs_raw(&self) -> Vec<(u32, u32)> {
         let mut candidates: HashSet<(u32, u32)> = HashSet::new();
         for files in self.buckets.values() {
-            if files.len() < 2 {
+            let mut sorted: Vec<u32> =
+                files.iter().copied().filter(|id| self.is_alive(*id)).collect();
+            if sorted.len() < 2 {
                 continue;
             }
-            let mut sorted = files.clone();
             sorted.sort_unstable();
             sorted.dedup();
             for i in 0..sorted.len() {
@@ -499,6 +660,178 @@ mod tests {
             "expected high-overlap pair, got {:.3}",
             pairs[0].jaccard
         );
+    }
+
+    // --- LSH tombstoning / incremental-update primitives -------------------------
+
+    fn ids_for_path<'a>(idx: &'a LshIndex, path: &str) -> Vec<u32> {
+        idx.path_to_ids
+            .get(&PathBuf::from(path))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn lsh_remove_by_path_drops_pair() {
+        let mut idx = LshIndex::with_defaults();
+        let set: Vec<u64> = (0..200).collect();
+        idx.add_file("a.rs".into(), "Rust", sketch_of(&set), 200);
+        idx.add_file("b.rs".into(), "Rust", sketch_of(&set), 200);
+        assert_eq!(idx.pair_report(0.5).len(), 1);
+        let removed = idx.remove_by_path(&PathBuf::from("a.rs"));
+        assert_eq!(removed.len(), 1);
+        assert!(idx.pair_report(0.5).is_empty(), "pair should disappear after removal");
+        assert_eq!(idx.file_count(), 1);
+        assert_eq!(idx.total_entries(), 2);
+    }
+
+    #[test]
+    fn lsh_partners_of_excludes_dead_ids() {
+        let mut idx = LshIndex::with_defaults();
+        let set: Vec<u64> = (0..200).collect();
+        idx.add_file("a.rs".into(), "Rust", sketch_of(&set), 200);
+        let mid_id = idx.add_file("b.rs".into(), "Rust", sketch_of(&set), 200);
+        idx.add_file("c.rs".into(), "Rust", sketch_of(&set), 200);
+        // All three are partners initially.
+        let a_partners = idx.partners_of(0);
+        assert_eq!(a_partners.len(), 2);
+        idx.remove_by_path(&PathBuf::from("b.rs"));
+        let after = idx.partners_of(0);
+        assert_eq!(after.len(), 1, "after removing b, a should only see c");
+        assert!(after.iter().all(|(id, _)| *id != mid_id));
+    }
+
+    #[test]
+    fn lsh_partners_of_works_on_dead_id() {
+        // Pre-removal capture pattern: we call partners_of on an ID that's about
+        // to be (or just was) tombstoned, to learn which pairs need invalidation.
+        let mut idx = LshIndex::with_defaults();
+        let set: Vec<u64> = (0..200).collect();
+        let a_id = idx.add_file("a.rs".into(), "Rust", sketch_of(&set), 200);
+        idx.add_file("b.rs".into(), "Rust", sketch_of(&set), 200);
+        idx.remove_by_path(&PathBuf::from("a.rs"));
+        assert!(!idx.is_alive(a_id));
+        let partners = idx.partners_of(a_id);
+        assert_eq!(
+            partners.len(),
+            1,
+            "dead a should still report b as a (live) partner so caller can invalidate the pair"
+        );
+    }
+
+    #[test]
+    fn lsh_compact_preserves_alive_queries_and_renumbers() {
+        let mut idx = LshIndex::with_defaults();
+        let set: Vec<u64> = (0..200).collect();
+        for name in ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"] {
+            idx.add_file(name.into(), "Rust", sketch_of(&set), 200);
+        }
+        // 5 files, all pairwise matching → 10 pairs.
+        assert_eq!(idx.pair_report(0.5).len(), 10);
+        idx.remove_by_path(&PathBuf::from("b.rs"));
+        idx.remove_by_path(&PathBuf::from("d.rs"));
+        // 3 live × 2 pairs each / 2 = 3 pairs.
+        assert_eq!(idx.pair_report(0.5).len(), 3);
+        assert!(idx.tombstone_ratio() > 0.3);
+        let total_before = idx.total_entries();
+        idx.compact();
+        // Compaction reassigns IDs but keeps the live result set identical.
+        assert_eq!(idx.pair_report(0.5).len(), 3);
+        assert_eq!(idx.tombstone_ratio(), 0.0);
+        assert!(idx.total_entries() < total_before);
+        // path_to_ids reflects the new IDs.
+        let new_a_ids = ids_for_path(&idx, "a.rs");
+        assert_eq!(new_a_ids.len(), 1);
+        assert!(idx.is_alive(new_a_ids[0]));
+    }
+
+    #[test]
+    fn lsh_readd_same_path_after_removal_works() {
+        let mut idx = LshIndex::with_defaults();
+        let set: Vec<u64> = (0..200).collect();
+        idx.add_file("a.rs".into(), "Rust", sketch_of(&set), 200);
+        idx.add_file("b.rs".into(), "Rust", sketch_of(&set), 200);
+        idx.remove_by_path(&PathBuf::from("a.rs"));
+        // Re-add with same path (e.g. file was edited but still resembles the original).
+        let new_id = idx.add_file("a.rs".into(), "Rust", sketch_of(&set), 200);
+        let live_a = ids_for_path(&idx, "a.rs");
+        assert_eq!(live_a, vec![new_id], "path_to_ids should only track the live entry");
+        assert_eq!(idx.pair_report(0.5).len(), 1);
+        assert_eq!(idx.file_count(), 2);
+        assert_eq!(idx.total_entries(), 3); // the dead entry still occupies a slot
+    }
+
+    #[test]
+    fn lsh_remove_then_compact_then_add_round_trip() {
+        // Build A, build B = (rebuild from scratch after a remove+compact+add cycle).
+        // Both should produce identical pair_report sets.
+        let set_one: Vec<u64> = (0..200).collect();
+        let set_two: Vec<u64> = (300..500).collect();
+
+        let mut a = LshIndex::with_defaults();
+        a.add_file("x.rs".into(), "Rust", sketch_of(&set_one), 200);
+        a.add_file("y.rs".into(), "Rust", sketch_of(&set_one), 200);
+        a.add_file("z.rs".into(), "Rust", sketch_of(&set_two), 200);
+        let a_pairs = sorted_pair_paths(&a.pair_report(0.5));
+
+        let mut b = LshIndex::with_defaults();
+        b.add_file("x.rs".into(), "Rust", sketch_of(&set_one), 200);
+        b.add_file("y.rs".into(), "Rust", sketch_of(&set_two), 200); // wrong content
+        b.add_file("z.rs".into(), "Rust", sketch_of(&set_two), 200);
+        // Fix it: remove y, add y with the right content. Compact.
+        b.remove_by_path(&PathBuf::from("y.rs"));
+        b.add_file("y.rs".into(), "Rust", sketch_of(&set_one), 200);
+        b.compact();
+        let b_pairs = sorted_pair_paths(&b.pair_report(0.5));
+
+        assert_eq!(a_pairs, b_pairs, "incremental path should match full-rebuild result");
+    }
+
+    fn sorted_pair_paths(pairs: &[PairReport]) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = pairs
+            .iter()
+            .map(|p| {
+                let a = p.file_a.to_string_lossy().to_string();
+                let b = p.file_b.to_string_lossy().to_string();
+                if a < b {
+                    (a, b)
+                } else {
+                    (b, a)
+                }
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn lsh_remove_unknown_path_is_noop() {
+        let mut idx = LshIndex::with_defaults();
+        let set: Vec<u64> = (0..200).collect();
+        idx.add_file("a.rs".into(), "Rust", sketch_of(&set), 200);
+        let removed = idx.remove_by_path(&PathBuf::from("nope.rs"));
+        assert!(removed.is_empty());
+        assert_eq!(idx.tombstone_ratio(), 0.0);
+        assert_eq!(idx.pair_report(0.5).len(), 0); // single live file
+    }
+
+    #[test]
+    fn lsh_compact_on_empty_index_is_noop() {
+        let mut idx = LshIndex::with_defaults();
+        idx.compact();
+        assert_eq!(idx.total_entries(), 0);
+        assert_eq!(idx.file_count(), 0);
+    }
+
+    #[test]
+    fn lsh_compact_with_no_tombstones_is_noop() {
+        let mut idx = LshIndex::with_defaults();
+        let set: Vec<u64> = (0..200).collect();
+        idx.add_file("a.rs".into(), "Rust", sketch_of(&set), 200);
+        idx.add_file("b.rs".into(), "Rust", sketch_of(&set), 200);
+        let before = idx.pair_report(0.5).len();
+        idx.compact();
+        assert_eq!(idx.pair_report(0.5).len(), before);
     }
 
     #[test]

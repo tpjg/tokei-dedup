@@ -2,16 +2,16 @@
 
 Language-agnostic duplicate code detection, built on a [tokei](https://github.com/XAMPPRocky/tokei)-style single-pass FSM tokenizer.
 
-**Status: pre-alpha, through milestone 5.** Whole-pipeline scan (332-language tokenizer → winnowing fingerprints → MinHash + banded LSH → tree-sitter function slicing for Rust/Python/JS/Go → exact-Jaccard verifier → heuristic classifier → HTML/JSON/terminal report) plus a basic LSP server. See [`DESIGN.md`](./DESIGN.md) for the architecture and full roadmap.
+**Status: beta, through milestone 6.** Whole-pipeline scan (332-language tokenizer → winnowing fingerprints → MinHash + banded LSH → tree-sitter function slicing for 11 languages → exact-Jaccard verifier → heuristic classifier → HTML/JSON/terminal report) plus a configurable LSP server with incremental re-indexing on save / create / rename / delete. See [`DESIGN.md`](./DESIGN.md) for the architecture and full roadmap.
 
 ## What it is
 
 A pipeline that takes a directory of source code, normalizes it through a fast byte-level state machine (driven by tokei's vendored language definitions), and detects duplicate code at two granularities:
 
-- **Whole-function duplicates** (Type 1–3 clones, via tree-sitter slicing today; AST-shape hashing planned in milestone 6)
+- **Whole-function duplicates** (Type 1–3 clones via tree-sitter slicing for 11 languages; AST-shape hashing is on the longer-term roadmap)
 - **Whole-file duplicates** (winnowing over the file's token stream)
 
-No LLM in the loop. ~1500-file Python repo: end-to-end in well under a second.
+No LLM in the loop. ~1500-file Python repo: end-to-end in well under a second; a 343k-LOC Rust+Gleam repo: under a second. Linux-kernel-scale (~30M LOC): around 20 s — but the LSP's incremental updates keep save-to-feedback sub-second regardless of repo size.
 
 ## Why
 
@@ -58,7 +58,7 @@ Most common invocations:
 # Whole-file mode, fast first pass
 dupe scan src/
 
-# Per-function clones — needs tree-sitter (Rust/Python/JS/Go currently)
+# Per-function clones — needs tree-sitter (11 languages, see Language support below)
 dupe scan src/ --granularity function --blind aggressive --min-jaccard 0.7
 
 # Render an HTML report alongside terminal output
@@ -132,7 +132,9 @@ Tags that may appear on a finding (any combination):
 
 ## LSP server: `dupe-lsp`
 
-`dupe-lsp` runs over stdio. On `initialize`, it scans the workspace once and **eagerly publishes diagnostics for every affected file** — so the editor's "Problems" / "Project Diagnostics" panel populates immediately, without needing to open each file first. On `didSave`, a debounced (500 ms) full-workspace rescan runs in the background, picks up new and removed clones, and re-publishes; this is fast enough for repos in the hundreds-of-thousands of lines (Rust+Gleam: ~340 kLOC scanned in under a second on a laptop). True incremental re-indexing is milestone-6 work.
+`dupe-lsp` runs over stdio. On `initialize`, it scans the workspace once and **eagerly publishes diagnostics for every affected file** — so the editor's "Problems" / "Project Diagnostics" panel populates immediately, without needing to open each file first.
+
+On save / create / rename / delete, it runs a **debounced (500 ms) incremental update**: only the changed files are re-fingerprinted, their old entries in the LSH index are tombstoned, and just the pair set touching those files is re-verified. The publish step pushes diagnostics only to URIs whose diagnostic list actually changed. Save-to-feedback latency stays sub-second even on multi-million-LOC workspaces. Content hashing means redundant saves (no content change) are no-ops. Set `"incremental": false` to fall back to full rescans on each save.
 
 Diagnostics are tiered by score: the top 20 findings (configurable) get `WARNING` severity so they surface in editor "Problems" panels (Zed and some other editors hide `INFORMATION` from the project view by default, so `WARNING` is the safest visible default); the long tail gets `HINT` (faint inline only). Each diagnostic links to the other endpoint via LSP related-information.
 
@@ -149,7 +151,8 @@ The defaults are intentionally strict — function-granularity, aggressive blind
 | `highlightTop` | integer | `20` | Findings ranked 1..N (by score) get the highlight severity |
 | `highlightSeverity` | `"hint" \| "information" \| "warning"` | `"warning"` | What the top-N diagnostics surface as. **Use `"warning"` (the default) for Zed** — Zed filters `INFORMATION`-level diagnostics out of the project panel |
 | `tailSeverity` | `"hint" \| "information" \| "warning" \| "off"` | `"hint"` | Severity for findings outside the top; `"off"` drops them entirely |
-| `rescanOnSave` | boolean | `true` | Re-run full workspace scan on every `didSave` (debounced 500 ms). Turn off if scan time on your repo exceeds ~2 s |
+| `rescanOnSave` | boolean | `true` | Re-process the workspace on every save (debounced 500 ms). Turn off if you'd rather restart the LSP manually |
+| `incremental` | boolean | `true` | Use the incremental engine (M6): re-fingerprint only changed files. Set `false` to fall back to a full workspace rescan on every save — same behavior as v0.1.0 |
 
 Unknown keys are tolerated (forward-compat); malformed values produce a `WARNING` log on the client and fall back to defaults.
 
@@ -208,7 +211,7 @@ language-servers = [ "rust-analyzer", "dupe-lsp" ]
 
 See the [`editors/zed/`](./editors/zed/) extension for a ready-to-install Zed integration. `initialization_options` are passed via `~/.config/zed/settings.json` under `lsp.dupe-lsp.initialization_options`.
 
-**Caveats:** `dupe-lsp` rescans the whole workspace on save (debounced 500 ms) rather than incrementally re-fingerprinting the changed file. For small-to-medium repos (up to a few hundred thousand non-comment lines) this is fast enough to feel instant; for larger repos, set `"rescanOnSave": false` and use `editor: restart language server` to manually refresh. True incremental re-indexing is milestone-6 work.
+**Caveats:** the LSP listens for `didSave`, `didCreateFiles`, `didRenameFiles`, and `didDeleteFiles`. Editors differ in how reliably they emit the last three — Helix and older Neovim versions notably skip some. If the editor misses a delete or rename the index keeps a stale entry until the file is touched again or the LSP is restarted (`editor: restart language server`). Save events always go through, which covers 99 % of update paths.
 
 ## For Claude Code (and other AI agents)
 
@@ -280,12 +283,14 @@ Two layers:
 | 0 | Scaffold + tokei-equivalent FSM, cross-validated | ✓ |
 | 1 | Winnowing fingerprints + naive index | ✓ |
 | 2 | MinHash + banded LSH | ✓ |
-| 3 | Tree-sitter function slicing (4 langs) | ✓ |
+| 3 | Tree-sitter function slicing (11 langs) | ✓ |
 | 4 | Verifier + classifier + HTML report | ✓ |
-| 5 | LSP server (first cut) | ✓ |
-| 6 | Incremental re-indexing, watch mode | — |
+| 5 | LSP server, configurable via `initializationOptions`, Zed extension | ✓ |
+| 6 | Incremental re-indexing (LSH tombstoning, per-path engine update, debounced workspace events) | ✓ |
 | 7 | Upstream `Visitor` PR to tokei | — |
 | 8 | Semantic enrichment via LSP | — |
+
+A `dupe watch` CLI was considered and explicitly dropped from M6: at the scale where a daemon would matter, a one-shot `dupe scan` already finishes (~20 s on the Linux kernel) faster than a human can digest the report. The LSP covers the editor case.
 
 ## License
 

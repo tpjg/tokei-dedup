@@ -2,21 +2,25 @@
 //!
 //! Lifecycle:
 //!   1. `initialize`: read `initializationOptions`, lock in scan + publish config.
-//!   2. `initialized`: scan once, eagerly publish diagnostics for every affected
-//!      URI, then spawn a background rescan loop that listens for save events.
-//!   3. `didOpen`: re-emit cached diagnostics for the opened file (covers files
-//!      that became visible after the initial publish).
-//!   4. `didSave`: if `rescanOnSave` is on, kick the rescan loop; otherwise
-//!      re-publish from cache.
+//!      Advertise interest in workspace file-operation events (create / rename
+//!      / delete) so the editor sends them.
+//!   2. `initialized`: build a long-lived [`IncrementalEngine`], run its
+//!      initial scan, publish diagnostics eagerly, spawn a debounced rescan
+//!      loop driven by `did_save` / `did_create_files` / `did_rename_files` /
+//!      `did_delete_files`.
+//!   3. `didOpen`: re-emit cached diagnostics for the opened file.
+//!   4. Save / create / rename / delete: enqueue the affected paths and notify
+//!      the loop. The loop sleeps [`RESCAN_DEBOUNCE`] to coalesce storms,
+//!      drains the queue, and applies the changes via [`IncrementalEngine::update`]
+//!      (or, when `incremental: false`, a full rescan as fallback).
 //!
-//! The rescan loop debounces 500 ms after the latest save and coalesces save
-//! storms into a single workspace rescan. Inline `didChange` events are
-//! ignored — true incremental re-fingerprinting needs LSH-entry removal,
-//! which is milestone-6 work (see `DESIGN.md`).
+//! Save events are de-duplicated by xxh3 of file content: if the on-disk
+//! content matches what we last fingerprinted (formatter-on-save round-trip,
+//! redundant Ctrl-S), the update is skipped.
 //!
 //! Diagnostic severity is tiered: the top N findings by score get a visible
-//! severity (default `INFORMATION`, surfaces in editor "Problems" panels);
-//! the long tail gets `HINT` (faint inline only). Both knobs are config.
+//! severity (default `WARNING`, surfaces in editor "Problems" panels); the
+//! long tail gets `HINT` (faint inline only). Both knobs are config.
 //!
 //! The server runs over stdio (LSP convention): editor pipes `--stdio`, the
 //! server reads JSON-RPC frames from stdin and writes to stdout.
@@ -25,14 +29,17 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::Duration;
 use tokei_dedup_classifier::Finding;
-use tokei_dedup_engine::{scan, BlindModeExt, Granularity, ScanOptions, WalkOptions};
+use tokei_dedup_engine::{
+    BlindModeExt, Granularity, IncrementalEngine, ScanOptions, WalkOptions,
+};
 use tokio::sync::{Mutex, Notify};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
+use xxhash_rust::xxh3::xxh3_64;
 
 /// Debounce window for `rescanOnSave`: a save event waits this long before
 /// kicking a rescan, and subsequent saves within the window coalesce into
@@ -57,6 +64,11 @@ struct InitOptions {
     highlight_severity: Option<String>,
     tail_severity: Option<String>,
     rescan_on_save: Option<bool>,
+    /// When `true` (default), save / create / rename / delete events go through
+    /// the incremental engine. When `false`, every rescan is a full workspace
+    /// scan — the v1 fallback, useful if incremental ever misbehaves on a
+    /// particular workspace.
+    incremental: Option<bool>,
 }
 
 /// Resolved diagnostic-publishing policy.
@@ -69,8 +81,12 @@ struct PublishOptions {
     /// `None` means findings outside the top are not published at all
     /// (`tailSeverity: "off"`).
     tail_severity: Option<DiagnosticSeverity>,
-    /// Whether `didSave` triggers a full workspace rescan.
+    /// Whether `didSave` triggers a workspace rescan.
     rescan_on_save: bool,
+    /// Whether `did_save` / `did_create_files` / `did_rename_files` /
+    /// `did_delete_files` go through the incremental engine. When `false`,
+    /// every rescan is a full workspace scan.
+    incremental: bool,
 }
 
 fn default_publish_opts() -> PublishOptions {
@@ -84,6 +100,7 @@ fn default_publish_opts() -> PublishOptions {
         highlight_severity: DiagnosticSeverity::WARNING,
         tail_severity: Some(DiagnosticSeverity::HINT),
         rescan_on_save: true,
+        incremental: true,
     }
 }
 
@@ -98,14 +115,19 @@ struct RankedFinding {
 struct DupeServer {
     client: Client,
     state: Arc<Mutex<State>>,
-    /// Set by `did_save`; cleared at the start of each rescan. Acts as the
-    /// "we have unflushed save events" flag for the rescan loop.
-    rescan_dirty: Arc<AtomicBool>,
-    /// Wakes the rescan loop. `did_save` calls `notify_one`; the loop
+    /// Long-lived incremental engine. `None` until `initialized` builds it.
+    /// Behind a sync mutex because the lock is held across blocking compute
+    /// (the engine's update / initial_scan methods do CPU-heavy work that
+    /// runs inside `tokio::task::spawn_blocking`).
+    engine: Arc<SyncMutex<Option<IncrementalEngine>>>,
+    /// Paths the rescan loop hasn't drained yet. `did_save`, `did_create_files`,
+    /// `did_rename_files`, `did_delete_files` push here; the loop drains.
+    pending_paths: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Wakes the rescan loop. Senders call `notify_one`; the loop
     /// `notified().await`s.
     rescan_notify: Arc<Notify>,
-    /// Set once when `initialized` spawns the rescan loop so the spawn
-    /// itself is idempotent.
+    /// Set once when `initialized` spawns the rescan loop so the spawn itself
+    /// is idempotent.
     rescan_loop_started: AtomicBool,
 }
 
@@ -116,16 +138,34 @@ struct State {
     publish_opts: Option<PublishOptions>,
     /// Map from absolute file path → score-ranked findings touching that file.
     by_file: HashMap<PathBuf, Vec<RankedFinding>>,
-    /// URIs we've published a non-empty diagnostic list for. On rescan we
-    /// publish empty lists for any that drop out, so removed clones don't
-    /// leave stale diagnostics in the editor.
+    /// URIs we've published a non-empty diagnostic list for. After every
+    /// publish round we send empty lists to any URI that dropped out, so
+    /// removed clones don't leave stale diagnostics in the editor.
     published_uris: HashSet<Url>,
+    /// xxh3 of file content the last time we fingerprinted it. Lets us skip
+    /// save events whose on-disk content didn't actually change.
+    file_hashes: HashMap<PathBuf, u64>,
     scanned: bool,
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for DupeServer {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let epoch_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "dupe-lsp: starting v{} pid={} epoch={}s",
+                    env!("CARGO_PKG_VERSION"),
+                    std::process::id(),
+                    epoch_s,
+                ),
+            )
+            .await;
         let root = workspace_root(&params);
         let (scan_opts, publish_opts, warnings) =
             resolve_init_opts(params.initialization_options.as_ref());
@@ -140,9 +180,34 @@ impl LanguageServer for DupeServer {
         }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::NONE,
+                // We don't track buffer contents (the engine re-reads from
+                // disk on save), but we still need the editor to send us
+                // didOpen/didSave/didClose. Advertising `Kind(NONE)` silences
+                // *all* text-document events including didSave — use Options
+                // with explicit save + open_close to opt back in.
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::NONE),
+                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                            include_text: Some(false),
+                        })),
+                        ..Default::default()
+                    },
                 )),
+                // Advertise interest in create/rename/delete so the editor
+                // actually sends those events. Filter `**` (every file) under
+                // the `file` scheme — the engine's own walker decides which
+                // extensions get fingerprinted; cheap to over-receive here.
+                workspace: Some(WorkspaceServerCapabilities {
+                    file_operations: Some(WorkspaceFileOperationsServerCapabilities {
+                        did_create: Some(file_op_registration()),
+                        did_rename: Some(file_op_registration()),
+                        did_delete: Some(file_op_registration()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -153,8 +218,14 @@ impl LanguageServer for DupeServer {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        run_scan_and_publish(&self.client, &self.state).await;
+        // Spawn the loop FIRST so any didSave that arrives during the initial
+        // scan is observed. The loop gates on engine readiness and won't try
+        // to update a None engine.
         self.spawn_rescan_loop();
+        run_initial_scan_and_publish(&self.client, &self.state, &self.engine).await;
+        // Kick the loop in case saves accumulated in pending_paths during the
+        // scan.
+        self.rescan_notify.notify_one();
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -170,20 +241,61 @@ impl LanguageServer for DupeServer {
                 .map(|p| p.rescan_on_save)
                 .unwrap_or(true)
         };
-        if rescan_on_save {
-            // Mark the workspace dirty and kick the loop; the loop debounces
-            // and runs the actual scan. The save event itself returns
-            // immediately.
-            self.rescan_dirty.store(true, Ordering::Relaxed);
-            self.rescan_notify.notify_one();
-        } else {
+        if !rescan_on_save {
             // No rescan — just refresh cached diagnostics for the saved file.
             self.publish_for_uri(&params.text_document.uri).await;
+            return;
         }
+        if let Ok(path) = params.text_document.uri.to_file_path() {
+            self.enqueue_paths(std::iter::once(path)).await;
+        }
+    }
+
+    async fn did_create_files(&self, params: CreateFilesParams) {
+        let paths = params
+            .files
+            .into_iter()
+            .filter_map(|f| Url::parse(&f.uri).ok())
+            .filter_map(|u| u.to_file_path().ok());
+        self.enqueue_paths(paths).await;
+    }
+
+    async fn did_rename_files(&self, params: RenameFilesParams) {
+        // Rename = delete-old + create-new. Both URIs need re-evaluation
+        // because the path-keyed index entry must move.
+        let paths = params
+            .files
+            .into_iter()
+            .flat_map(|f| [Url::parse(&f.old_uri), Url::parse(&f.new_uri)])
+            .filter_map(|r| r.ok())
+            .filter_map(|u| u.to_file_path().ok());
+        self.enqueue_paths(paths).await;
+    }
+
+    async fn did_delete_files(&self, params: DeleteFilesParams) {
+        let paths = params
+            .files
+            .into_iter()
+            .filter_map(|f| Url::parse(&f.uri).ok())
+            .filter_map(|u| u.to_file_path().ok());
+        self.enqueue_paths(paths).await;
     }
 
     async fn shutdown(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+fn file_op_registration() -> FileOperationRegistrationOptions {
+    FileOperationRegistrationOptions {
+        filters: vec![FileOperationFilter {
+            scheme: Some("file".into()),
+            pattern: FileOperationPattern {
+                glob: "**".into(),
+                matches: None,
+                options: None,
+            },
+        }],
     }
 }
 
@@ -212,39 +324,86 @@ impl DupeServer {
             .await;
     }
 
-    /// Idempotently spawn the background rescan loop. Driven by
-    /// `rescan_notify` / `rescan_dirty`. The loop waits for the next
-    /// notify, sleeps [`RESCAN_DEBOUNCE`] to coalesce save storms, then
-    /// runs a scan if the dirty flag was set. Save events arriving
-    /// mid-scan re-set the flag, so a follow-up scan runs once the
-    /// current one finishes.
+    /// Enqueue paths into the pending set and notify the rescan loop.
+    async fn enqueue_paths<I: IntoIterator<Item = PathBuf>>(&self, paths: I) {
+        let mut inserted = 0usize;
+        {
+            let mut pp = self.pending_paths.lock().await;
+            for p in paths {
+                if pp.insert(p) {
+                    inserted += 1;
+                }
+            }
+        }
+        if inserted > 0 {
+            self.rescan_notify.notify_one();
+        }
+    }
+
+    /// Idempotently spawn the background rescan loop. The loop waits for the
+    /// next notify, sleeps [`RESCAN_DEBOUNCE`] to coalesce storms, drains
+    /// `pending_paths`, and applies the change set. Save events arriving
+    /// mid-rescan stay in the pending set; the loop iterates again
+    /// immediately because `notify_one` stored a fresh permit.
     fn spawn_rescan_loop(&self) {
         if self.rescan_loop_started.swap(true, Ordering::SeqCst) {
             return; // already running
         }
-        let dirty = self.rescan_dirty.clone();
         let notify = self.rescan_notify.clone();
+        let pending = self.pending_paths.clone();
         let client = self.client.clone();
         let state = self.state.clone();
+        let engine = self.engine.clone();
         tokio::spawn(async move {
             loop {
                 notify.notified().await;
                 tokio::time::sleep(RESCAN_DEBOUNCE).await;
-                if dirty.swap(false, Ordering::Relaxed) {
-                    run_scan_and_publish(&client, &state).await;
+                // Engine not built yet → leave pending_paths alone and wait
+                // for the next notify (initial-scan completion sends one).
+                // Should not normally fire after `initialized` returns; if it
+                // does, init ordering or initial_scan completion has broken.
+                let engine_ready = engine.lock().unwrap().is_some();
+                if !engine_ready {
+                    client
+                        .log_message(
+                            MessageType::WARNING,
+                            "dupe-lsp: rescan loop: engine not ready, deferring",
+                        )
+                        .await;
+                    continue;
+                }
+                let drained: Vec<PathBuf> = {
+                    let mut pp = pending.lock().await;
+                    pp.drain().collect()
+                };
+                if drained.is_empty() {
+                    continue;
+                }
+                let incremental = {
+                    let s = state.lock().await;
+                    s.publish_opts
+                        .as_ref()
+                        .map(|p| p.incremental)
+                        .unwrap_or(true)
+                };
+                if incremental {
+                    run_incremental_update_and_publish(&client, &state, &engine, drained).await;
+                } else {
+                    run_full_rescan_and_publish(&client, &state, &engine).await;
                 }
             }
         });
     }
 }
 
-/// Run the scan with whatever options are currently in `state`, rank
-/// findings, swap state, and publish diagnostics for every affected URI
-/// (clearing any URIs whose findings disappeared since the last scan).
-///
-/// Free function (not a method) so the rescan task can call it directly
-/// without keeping a `DupeServer` reference across `await` points.
-async fn run_scan_and_publish(client: &Client, state: &Arc<Mutex<State>>) {
+/// First scan on `initialized`. Always populates the engine — even with
+/// `incremental: false`, the engine is the canonical finding source post-init;
+/// the `incremental: false` flag only changes how *updates* are processed.
+async fn run_initial_scan_and_publish(
+    client: &Client,
+    state: &Arc<Mutex<State>>,
+    engine: &Arc<SyncMutex<Option<IncrementalEngine>>>,
+) {
     let (root, scan_opts, pub_opts) = {
         let s = state.lock().await;
         (
@@ -262,11 +421,197 @@ async fn run_scan_and_publish(client: &Client, state: &Arc<Mutex<State>>) {
             .await;
         return;
     };
+    log_scan_start(client, &root, &scan_opts, "initial scan").await;
+
+    // Build the engine and run its initial_scan. spawn_blocking so we don't
+    // tie up the LSP runtime; return the engine back so we can stash it.
+    let engine_clone = engine.clone();
+    let root_clone = root.clone();
+    let scan_opts_clone = scan_opts.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let mut e = IncrementalEngine::new(root_clone, scan_opts_clone);
+        let r = e.initial_scan();
+        let mut guard = engine_clone.lock().unwrap();
+        *guard = Some(e);
+        r
+    })
+    .await
+    .ok();
+    let Some(scan_result) = res else {
+        client
+            .log_message(MessageType::ERROR, "dupe-lsp: initial scan task failed")
+            .await;
+        return;
+    };
+
+    let findings = scan_result.findings.clone();
+    let total = findings.len();
+    let elapsed = scan_result.elapsed_secs;
+    seed_file_hashes(state, &findings).await;
+    publish_findings(client, state, &pub_opts, findings).await;
+
+    let highlighted = std::cmp::min(total, pub_opts.highlight_top);
     client
         .log_message(
             MessageType::INFO,
             format!(
-                "dupe-lsp: scanning {} (granularity={:?}, blind={:?}, min_jaccard={:.2}, excludes={})",
+                "dupe-lsp: initial scan complete — {total} findings ({highlighted} highlighted) in {elapsed:.2}s",
+            ),
+        )
+        .await;
+}
+
+/// Apply `changed_paths` via the incremental engine and republish diagnostics
+/// for the URIs that actually changed.
+async fn run_incremental_update_and_publish(
+    client: &Client,
+    state: &Arc<Mutex<State>>,
+    engine: &Arc<SyncMutex<Option<IncrementalEngine>>>,
+    changed_paths: Vec<PathBuf>,
+) {
+    let pub_opts = {
+        let s = state.lock().await;
+        s.publish_opts.clone().unwrap_or_else(default_publish_opts)
+    };
+
+    // Hash-skip pass. Read each changed file and compare its content hash
+    // against the cached one; drop unchanged paths. Deleted files (where
+    // the read fails) stay in the set because the engine needs to see them
+    // as removals.
+    let actual_changes = filter_unchanged_by_hash(state, changed_paths).await;
+    if actual_changes.is_empty() {
+        client
+            .log_message(
+                MessageType::INFO,
+                "dupe-lsp: save event with no content change — skipping rescan",
+            )
+            .await;
+        return;
+    }
+
+    let engine_clone = engine.clone();
+    let changes_clone = actual_changes.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let mut guard = engine_clone.lock().unwrap();
+        let Some(engine_ref) = guard.as_mut() else {
+            return None;
+        };
+        let r = engine_ref.update(&changes_clone);
+        let findings: Vec<Finding> = engine_ref.findings().cloned().collect();
+        Some((r, findings))
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some((incremental_result, findings)) = res else {
+        client
+            .log_message(MessageType::ERROR, "dupe-lsp: incremental update failed")
+            .await;
+        return;
+    };
+
+    let total = findings.len();
+    publish_findings(client, state, &pub_opts, findings).await;
+
+    client
+        .log_message(
+            MessageType::INFO,
+            format!(
+                "dupe-lsp: incremental update — +{} / -{} / ~{} ({total} total) in {:.2}s for {} path(s)",
+                incremental_result.added.len(),
+                incremental_result.removed.len(),
+                incremental_result.updated.len(),
+                incremental_result.elapsed_secs,
+                actual_changes.len(),
+            ),
+        )
+        .await;
+}
+
+/// Full workspace rescan: drop the existing engine, build a fresh one,
+/// initial_scan, publish. Used only when `incremental: false`. The cost is
+/// the same as Phase-0-PR-12 behavior — this is the explicit fallback.
+async fn run_full_rescan_and_publish(
+    client: &Client,
+    state: &Arc<Mutex<State>>,
+    engine: &Arc<SyncMutex<Option<IncrementalEngine>>>,
+) {
+    // The "drop and rebuild" semantics are exactly what `initial_scan` does
+    // internally — clearing index + caches before re-fingerprinting — so we
+    // just call the same path. The engine field is rebuilt inside.
+    run_initial_scan_and_publish(client, state, engine).await;
+}
+
+/// Shared: rank a flat finding list, derive the path→ranked map, diff
+/// against the previously-published URI set, and publish only what changed.
+async fn publish_findings(
+    client: &Client,
+    state: &Arc<Mutex<State>>,
+    pub_opts: &PublishOptions,
+    findings: Vec<Finding>,
+) {
+    let by_file = rank_and_group(findings, pub_opts);
+    let new_uris: HashSet<Url> = by_file
+        .keys()
+        .filter_map(|p| Url::from_file_path(p).ok())
+        .collect();
+
+    let (to_clear, to_publish): (Vec<Url>, Vec<(Url, Vec<Diagnostic>)>) = {
+        let s = state.lock().await;
+        let to_clear: Vec<Url> = s.published_uris.difference(&new_uris).cloned().collect();
+        let to_publish: Vec<(Url, Vec<Diagnostic>)> = by_file
+            .iter()
+            .filter_map(|(p, rfs)| {
+                let uri = Url::from_file_path(p).ok()?;
+                // Skip URIs whose diagnostic list matches what we last
+                // published — saves a publish_diagnostics RPC per untouched
+                // file under incremental updates.
+                let new_diags: Vec<Diagnostic> = rfs
+                    .iter()
+                    .filter_map(|rf| make_diagnostic(&rf.finding, rf.severity, p))
+                    .collect();
+                let old = s.by_file.get(p);
+                if let Some(old_rfs) = old {
+                    let old_diags: Vec<Diagnostic> = old_rfs
+                        .iter()
+                        .filter_map(|rf| make_diagnostic(&rf.finding, rf.severity, p))
+                        .collect();
+                    if diagnostics_equal(&old_diags, &new_diags) {
+                        return None;
+                    }
+                }
+                Some((uri, new_diags))
+            })
+            .collect();
+        (to_clear, to_publish)
+    };
+
+    {
+        let mut s = state.lock().await;
+        s.by_file = by_file;
+        s.published_uris = new_uris;
+        s.scanned = true;
+    }
+
+    for uri in to_clear {
+        client.publish_diagnostics(uri, vec![], None).await;
+    }
+    for (uri, diags) in to_publish {
+        client.publish_diagnostics(uri, diags, None).await;
+    }
+}
+
+async fn log_scan_start(
+    client: &Client,
+    root: &Path,
+    scan_opts: &ScanOptions,
+    label: &str,
+) {
+    client
+        .log_message(
+            MessageType::INFO,
+            format!(
+                "dupe-lsp: {label} {} (granularity={:?}, blind={:?}, min_jaccard={:.2}, excludes={})",
                 root.display(),
                 scan_opts.granularity,
                 scan_opts.blind,
@@ -275,68 +620,86 @@ async fn run_scan_and_publish(client: &Client, state: &Arc<Mutex<State>>) {
             ),
         )
         .await;
-    let root_clone = root.clone();
-    let scan_opts_clone = scan_opts.clone();
-    let scan_result =
-        tokio::task::spawn_blocking(move || scan(&root_clone, &scan_opts_clone))
-            .await
-            .ok();
-    let Some(result) = scan_result else {
-        client
-            .log_message(MessageType::ERROR, "dupe-lsp: scan task failed")
-            .await;
-        return;
-    };
-    let total = result.findings.len();
-    let elapsed = result.elapsed_secs;
-    let by_file = rank_and_group(result.findings, &pub_opts);
+}
 
-    let new_uris: HashSet<Url> = by_file
-        .keys()
-        .filter_map(|p| Url::from_file_path(p).ok())
-        .collect();
-    let to_clear: Vec<Url> = {
+/// Read each path's current content (where it exists), hash it, and return
+/// only the paths whose content differs from `state.file_hashes`. Missing
+/// files (deletions) are kept — the engine needs to see them. Updates the
+/// stored hash for every path it kept.
+async fn filter_unchanged_by_hash(
+    state: &Arc<Mutex<State>>,
+    paths: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut kept = Vec::with_capacity(paths.len());
+    let mut new_hashes = Vec::new();
+    let mut to_forget: Vec<PathBuf> = Vec::new();
+    let existing = {
         let s = state.lock().await;
-        s.published_uris.difference(&new_uris).cloned().collect()
+        s.file_hashes.clone()
     };
-    let to_publish: Vec<(Url, Vec<Diagnostic>)> = by_file
-        .iter()
-        .filter_map(|(p, rfs)| {
-            let uri = Url::from_file_path(p).ok()?;
-            let diags = rfs
-                .iter()
-                .filter_map(|rf| make_diagnostic(&rf.finding, rf.severity, p))
-                .collect();
-            Some((uri, diags))
-        })
-        .collect();
-    let touched_files = by_file.len();
-    {
+    for path in paths {
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let h = xxh3_64(&bytes);
+                if existing.get(&path).copied() != Some(h) {
+                    kept.push(path.clone());
+                    new_hashes.push((path, h));
+                }
+            }
+            Err(_) => {
+                // File missing or unreadable. Treat as a deletion: keep it
+                // in the change set so the engine tombstones its entries.
+                kept.push(path.clone());
+                to_forget.push(path);
+            }
+        }
+    }
+    if !new_hashes.is_empty() || !to_forget.is_empty() {
         let mut s = state.lock().await;
-        s.by_file = by_file;
-        s.published_uris = new_uris;
-        s.scanned = true;
+        for (p, h) in new_hashes {
+            s.file_hashes.insert(p, h);
+        }
+        for p in to_forget {
+            s.file_hashes.remove(&p);
+        }
     }
+    kept
+}
 
-    // Lock released before the publish loop: `publish_diagnostics` can be
-    // long for big results and we don't want to block did_open / did_save
-    // during it.
-    for uri in to_clear {
-        client.publish_diagnostics(uri, vec![], None).await;
+/// Seed the file-hash cache after an initial scan so the first save can
+/// detect unchanged-content correctly. Best-effort: read failures just leave
+/// the hash unset, in which case the first save on that file falls through
+/// to the engine update path (same as before this optimization existed).
+async fn seed_file_hashes(state: &Arc<Mutex<State>>, findings: &[Finding]) {
+    let mut paths: HashSet<PathBuf> = HashSet::new();
+    for f in findings {
+        paths.insert(f.a.path.clone());
+        paths.insert(f.b.path.clone());
     }
-    for (uri, diags) in to_publish {
-        client.publish_diagnostics(uri, diags, None).await;
+    let mut hashes = Vec::with_capacity(paths.len());
+    for p in paths {
+        if let Ok(bytes) = std::fs::read(&p) {
+            hashes.push((p, xxh3_64(&bytes)));
+        }
     }
+    let mut s = state.lock().await;
+    for (p, h) in hashes {
+        s.file_hashes.insert(p, h);
+    }
+}
 
-    let highlighted = std::cmp::min(total, pub_opts.highlight_top);
-    client
-        .log_message(
-            MessageType::INFO,
-            format!(
-                "dupe-lsp: scan complete — {total} findings ({highlighted} highlighted) touching {touched_files} files in {elapsed:.2}s",
-            ),
-        )
-        .await;
+fn diagnostics_equal(a: &[Diagnostic], b: &[Diagnostic]) -> bool {
+    // Diagnostic isn't Eq, but its fields we care about (range, severity,
+    // message, related_information) are. Skip serde-only fields.
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).all(|(x, y)| {
+        x.range == y.range
+            && x.severity == y.severity
+            && x.message == y.message
+            && x.related_information == y.related_information
+    })
 }
 
 fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
@@ -447,6 +810,9 @@ fn resolve_init_opts(
     }
     if let Some(b) = parsed.rescan_on_save {
         pub_opts.rescan_on_save = b;
+    }
+    if let Some(b) = parsed.incremental {
+        pub_opts.incremental = b;
     }
     (scan_opts, pub_opts, warnings)
 }
@@ -625,6 +991,15 @@ mod tests {
         assert_eq!(pub_opts.highlight_severity, DiagnosticSeverity::WARNING);
         assert_eq!(pub_opts.tail_severity, Some(DiagnosticSeverity::HINT));
         assert!(pub_opts.rescan_on_save);
+        assert!(pub_opts.incremental);
+    }
+
+    #[test]
+    fn incremental_can_be_disabled() {
+        let raw = json!({ "incremental": false });
+        let (_scan, pub_opts, warns) = resolve_init_opts(Some(&raw));
+        assert!(warns.is_empty());
+        assert!(!pub_opts.incremental);
     }
 
     #[test]
@@ -788,6 +1163,7 @@ mod tests {
             highlight_severity: DiagnosticSeverity::INFORMATION,
             tail_severity: None,
             rescan_on_save: true,
+            incremental: true,
         };
         let map = rank_and_group(findings, &pub_opts);
         let total: usize = map.values().map(|v| v.len()).sum();
@@ -813,7 +1189,8 @@ async fn main() {
     let (service, socket) = LspService::new(|client| DupeServer {
         client,
         state: Arc::new(Mutex::new(State::default())),
-        rescan_dirty: Arc::new(AtomicBool::new(false)),
+        engine: Arc::new(SyncMutex::new(None)),
+        pending_paths: Arc::new(Mutex::new(HashSet::new())),
         rescan_notify: Arc::new(Notify::new()),
         rescan_loop_started: AtomicBool::new(false),
     });
