@@ -571,8 +571,10 @@ impl IncrementalEngine {
         let paths = walk_filtered(&self.workspace_root, &self.opts.walk);
         let files_walked = paths.len();
 
+        // par_iter to match the standalone `scan()` path — the sequential
+        // .iter() was pinning the LSP initial scan to one core.
         let items: Vec<Item> = paths
-            .iter()
+            .par_iter()
             .flat_map(|p| {
                 process_path(
                     &self.normalizer,

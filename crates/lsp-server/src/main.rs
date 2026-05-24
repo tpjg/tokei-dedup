@@ -151,6 +151,21 @@ struct State {
 #[tower_lsp::async_trait]
 impl LanguageServer for DupeServer {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let epoch_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "dupe-lsp: starting v{} pid={} epoch={}s",
+                    env!("CARGO_PKG_VERSION"),
+                    std::process::id(),
+                    epoch_s,
+                ),
+            )
+            .await;
         let root = workspace_root(&params);
         let (scan_opts, publish_opts, warnings) =
             resolve_init_opts(params.initialization_options.as_ref());
@@ -165,8 +180,20 @@ impl LanguageServer for DupeServer {
         }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::NONE,
+                // We don't track buffer contents (the engine re-reads from
+                // disk on save), but we still need the editor to send us
+                // didOpen/didSave/didClose. Advertising `Kind(NONE)` silences
+                // *all* text-document events including didSave — use Options
+                // with explicit save + open_close to opt back in.
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::NONE),
+                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                            include_text: Some(false),
+                        })),
+                        ..Default::default()
+                    },
                 )),
                 // Advertise interest in create/rename/delete so the editor
                 // actually sends those events. Filter `**` (every file) under
@@ -191,8 +218,14 @@ impl LanguageServer for DupeServer {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        run_initial_scan_and_publish(&self.client, &self.state, &self.engine).await;
+        // Spawn the loop FIRST so any didSave that arrives during the initial
+        // scan is observed. The loop gates on engine readiness and won't try
+        // to update a None engine.
         self.spawn_rescan_loop();
+        run_initial_scan_and_publish(&self.client, &self.state, &self.engine).await;
+        // Kick the loop in case saves accumulated in pending_paths during the
+        // scan.
+        self.rescan_notify.notify_one();
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -293,14 +326,16 @@ impl DupeServer {
 
     /// Enqueue paths into the pending set and notify the rescan loop.
     async fn enqueue_paths<I: IntoIterator<Item = PathBuf>>(&self, paths: I) {
-        let mut pp = self.pending_paths.lock().await;
-        let mut any = false;
-        for p in paths {
-            pp.insert(p);
-            any = true;
+        let mut inserted = 0usize;
+        {
+            let mut pp = self.pending_paths.lock().await;
+            for p in paths {
+                if pp.insert(p) {
+                    inserted += 1;
+                }
+            }
         }
-        drop(pp);
-        if any {
+        if inserted > 0 {
             self.rescan_notify.notify_one();
         }
     }
@@ -323,6 +358,20 @@ impl DupeServer {
             loop {
                 notify.notified().await;
                 tokio::time::sleep(RESCAN_DEBOUNCE).await;
+                // Engine not built yet → leave pending_paths alone and wait
+                // for the next notify (initial-scan completion sends one).
+                // Should not normally fire after `initialized` returns; if it
+                // does, init ordering or initial_scan completion has broken.
+                let engine_ready = engine.lock().unwrap().is_some();
+                if !engine_ready {
+                    client
+                        .log_message(
+                            MessageType::WARNING,
+                            "dupe-lsp: rescan loop: engine not ready, deferring",
+                        )
+                        .await;
+                    continue;
+                }
                 let drained: Vec<PathBuf> = {
                     let mut pp = pending.lock().await;
                     pp.drain().collect()
