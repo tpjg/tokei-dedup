@@ -218,6 +218,12 @@ See the [`editors/zed/`](./editors/zed/) extension for a ready-to-install Zed in
 
 Use the **CLI in `--json` mode**. The LSP is designed for interactive editors and doesn't suit a one-shot analysis. See [`SKILL.md`](./SKILL.md).
 
+You may also want to prevent duplicates for typical utility functions by copying `SKILL-search.md` into ~/.claude/skills/dedup-search/SKILL.md and including something like the following in `CLAUDE.md`:
+```markdown
+**DRY.** Scan for existing functions before implementing. Use the `dedup-search` skill before writing any utility-shaped function. Use agents (`model="sonnet"`) to explore the codebase rather than filling your own context.
+```
+
+
 ## Language support
 
 Two layers, with different coverage:
