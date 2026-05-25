@@ -56,6 +56,11 @@ SKETCH
 When both snippet and keyword search return the same function, that's a
 strong signal regardless of the individual scores.
 
+If keyword search returns results but the function names are clearly
+unrelated (e.g., searching for "http client" and getting "json_out" because
+it coincidentally uses "json"), the results are noise — proceed with
+implementation.
+
 ### When to skip the search
 
 - You're modifying an existing function (you already found it).
