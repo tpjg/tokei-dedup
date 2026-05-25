@@ -12,12 +12,14 @@ tokei-dedup-core = { workspace = true }
 tokei-dedup-lang-config = { workspace = true }
 tokei-dedup-normalizer = { workspace = true }
 tokei-dedup-fingerprinter = { workspace = true }
-tokei-dedup-index = { workspace = true }
+tokei-dedup-index = { workspace = true, features = ["serde"] }
 tokei-dedup-slicer = { workspace = true }
 tokei-dedup-verifier = { workspace = true }
 tokei-dedup-classifier = { workspace = true }
 ignore = { workspace = true }
 rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 walkdir = { workspace = true }

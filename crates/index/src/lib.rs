@@ -18,9 +18,13 @@ use std::path::{Path, PathBuf};
 use tokei_dedup_fingerprinter::{jaccard_from_sketches, Fingerprint, Sketch, SIGNATURE_SIZE};
 use xxhash_rust::xxh3::Xxh3;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// Sub-file region metadata. Carried alongside path/lang for function-level entries
 /// (milestone 3+). `None` on a `FileMeta` means the entry is the whole file.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct GranuleInfo {
     pub line_start: u32,
     pub line_end: u32,
@@ -349,6 +353,29 @@ impl LshIndex {
             }
         }
         ids
+    }
+
+    /// Probe the index for entries similar to an external sketch without inserting it.
+    ///
+    /// Walks all band buckets the query sketch would fall into, collects live entries
+    /// sharing any band, and returns each with the sketch-Jaccard estimate. Results
+    /// are deduplicated across bands.
+    pub fn query_sketch(&self, query: &Sketch) -> Vec<(u32, f32)> {
+        let mut seen: HashSet<u32> = HashSet::new();
+        for band in 0..self.bands {
+            let key = band_hash(query, band, self.rows);
+            let Some(bucket) = self.buckets.get(&key) else {
+                continue;
+            };
+            for &id in bucket {
+                if self.is_alive(id) {
+                    seen.insert(id);
+                }
+            }
+        }
+        seen.into_iter()
+            .map(|id| (id, jaccard_from_sketches(query, &self.sketches[id as usize])))
+            .collect()
     }
 
     /// Live partners of `id` together with the sketch-Jaccard estimate.

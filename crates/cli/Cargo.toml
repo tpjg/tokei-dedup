@@ -18,6 +18,7 @@ tokei-dedup-engine = { workspace = true }
 tokei-dedup-fingerprinter = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokei-dedup-core = { workspace = true }

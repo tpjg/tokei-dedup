@@ -10,3 +10,8 @@ description = "Inverted-index over fingerprint hashes; reports candidate duplica
 [dependencies]
 tokei-dedup-fingerprinter = { workspace = true }
 xxhash-rust = { workspace = true }
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
