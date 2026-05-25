@@ -652,4 +652,135 @@ mod tests {
     fn split_identifier_all_lower() {
         assert_eq!(split_identifier("validate"), vec!["validate"]);
     }
+
+    #[test]
+    fn snippet_search_finds_similar_function() {
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tests/fixtures/search-corpus");
+        if !corpus.exists() {
+            return;
+        }
+        let opts = ScanOptions {
+            granularity: Granularity::Function,
+            blind: tokei_dedup_core::BlindMode::Aggressive,
+            ..ScanOptions::default()
+        };
+        let index = SearchIndex::build(&corpus, &opts);
+        assert!(index.entries.len() > 10);
+
+        let sketch = r#"
+def validate_email(email):
+    if not email or '@' not in email:
+        return False
+    parts = email.split('@')
+    if len(parts) != 2:
+        return False
+    local, domain = parts
+    if '.' not in domain:
+        return False
+    return True
+"#;
+        let result = index.search_snippet(sketch, Some("Python"), 0.2, 5);
+        assert!(!result.matches.is_empty());
+        assert_eq!(
+            result.matches[0].fn_name.as_deref(),
+            Some("verify_email_format")
+        );
+    }
+
+    #[test]
+    fn keyword_search_finds_by_identifiers() {
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tests/fixtures/search-corpus");
+        if !corpus.exists() {
+            return;
+        }
+        let opts = ScanOptions {
+            granularity: Granularity::Function,
+            blind: tokei_dedup_core::BlindMode::Aggressive,
+            ..ScanOptions::default()
+        };
+        let index = SearchIndex::build(&corpus, &opts);
+
+        let result = index.search_keywords("retry backoff exponential", 5);
+        assert!(!result.matches.is_empty());
+        assert_eq!(
+            result.matches[0].fn_name.as_deref(),
+            Some("retry_with_backoff")
+        );
+    }
+
+    #[test]
+    fn no_matches_for_novel_code() {
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tests/fixtures/search-corpus");
+        if !corpus.exists() {
+            return;
+        }
+        let opts = ScanOptions {
+            granularity: Granularity::Function,
+            blind: tokei_dedup_core::BlindMode::Aggressive,
+            ..ScanOptions::default()
+        };
+        let index = SearchIndex::build(&corpus, &opts);
+
+        let sketch = r#"
+def calculate_haversine_distance(lat1, lon1, lat2, lon2):
+    import math
+    R = 6371
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    return R * c
+"#;
+        let result = index.search_snippet(sketch, Some("Python"), 0.2, 5);
+        assert!(result.matches.is_empty());
+    }
+
+    #[test]
+    fn index_persistence_roundtrip() {
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tests/fixtures/search-corpus");
+        if !corpus.exists() {
+            return;
+        }
+        let opts = ScanOptions {
+            granularity: Granularity::Function,
+            blind: tokei_dedup_core::BlindMode::Aggressive,
+            ..ScanOptions::default()
+        };
+        let index = SearchIndex::build(&corpus, &opts);
+        let dir = std::env::temp_dir().join("dupe-test-index");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("test-index.json");
+        index.save(&path).unwrap();
+        let loaded = SearchIndex::load(&path).unwrap();
+        assert_eq!(loaded.entries.len(), index.entries.len());
+
+        // Loaded index should produce the same search results
+        let result = loaded.search_keywords("email format verify", 3);
+        assert!(!result.matches.is_empty());
+        assert_eq!(
+            result.matches[0].fn_name.as_deref(),
+            Some("verify_email_format")
+        );
+        std::fs::remove_file(&path).ok();
+    }
 }
