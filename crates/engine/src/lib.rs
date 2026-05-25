@@ -10,6 +10,8 @@
 //!    relative to `workspace`.
 //! 5. Return a [`ScanResult`] with the findings plus diagnostic stats.
 
+pub mod search;
+
 use ignore::{overrides::OverrideBuilder, WalkBuilder};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -29,7 +31,7 @@ use tokei_dedup_verifier::{verify, Verified};
 pub use tokei_dedup_classifier::{Finding as ClassifiedFinding, ItemRef as FindingEndpoint, Tag};
 pub use tokei_dedup_core::BlindMode as BlindModeExt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Granularity {
     File,
     Function,

@@ -11,7 +11,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use tokei_dedup_classifier::ItemRef;
 use tokei_dedup_core::BlindMode;
-use tokei_dedup_engine::{scan, Granularity as EngineGranularity, ScanOptions, ScanResult, WalkOptions};
+use tokei_dedup_engine::{
+    scan,
+    search::SearchIndex,
+    Granularity as EngineGranularity, ScanOptions, ScanResult, WalkOptions,
+};
 
 #[derive(Parser)]
 #[command(name = "dupe", version, about)]
@@ -80,6 +84,97 @@ enum Command {
         /// Don't apply the built-in DEFAULT_EXCLUDES list (target, node_modules,
         /// dist, build, .venv, …). Use `--no-default-excludes --no-gitignore` to
         /// scan everything except what you pass to `--exclude`.
+        #[arg(long)]
+        no_default_excludes: bool,
+    },
+
+    /// Build a persistent search index for fast repeated queries.
+    Index {
+        /// Directory to index.
+        dir: PathBuf,
+
+        /// Output path for the index file.
+        #[arg(long, short, default_value = ".dupe-index.json")]
+        out: PathBuf,
+
+        #[arg(long, value_enum, default_value_t = Blind::Aggressive)]
+        blind: Blind,
+
+        #[arg(long, value_enum, default_value_t = Granularity::Function)]
+        granularity: Granularity,
+
+        #[arg(long, default_value_t = tokei_dedup_fingerprinter::DEFAULT_K)]
+        k: usize,
+
+        #[arg(long, default_value_t = tokei_dedup_fingerprinter::DEFAULT_WINDOW)]
+        window: usize,
+
+        #[arg(long)]
+        only_lang: Option<String>,
+
+        #[arg(long = "exclude", value_name = "PATTERN")]
+        exclude: Vec<String>,
+
+        #[arg(long)]
+        no_gitignore: bool,
+
+        #[arg(long)]
+        no_default_excludes: bool,
+    },
+
+    /// Search for existing functions similar to code you're about to write.
+    Search {
+        /// Code snippet file to search for (use "-" for stdin).
+        #[arg(long, conflicts_with = "keywords")]
+        snippet: Option<String>,
+
+        /// Keyword query (identifier fragments, space-separated).
+        #[arg(long, conflicts_with = "snippet")]
+        keywords: Option<String>,
+
+        /// Directory to search in (builds index on the fly if --index not given).
+        #[arg(long, required_unless_present = "index")]
+        r#in: Option<PathBuf>,
+
+        /// Use a pre-built index file instead of scanning on the fly.
+        #[arg(long)]
+        index: Option<PathBuf>,
+
+        /// Language hint for snippet search (e.g. "Python", "Rust", "py", "rs").
+        #[arg(long)]
+        lang: Option<String>,
+
+        #[arg(long, value_enum, default_value_t = Blind::Aggressive)]
+        blind: Blind,
+
+        #[arg(long, value_enum, default_value_t = Granularity::Function)]
+        granularity: Granularity,
+
+        #[arg(long, default_value_t = tokei_dedup_fingerprinter::DEFAULT_K)]
+        k: usize,
+
+        #[arg(long, default_value_t = tokei_dedup_fingerprinter::DEFAULT_WINDOW)]
+        window: usize,
+
+        #[arg(long, default_value_t = 0.3)]
+        min_jaccard: f32,
+
+        #[arg(long, default_value_t = 10)]
+        top: usize,
+
+        /// Emit JSON output (default for agent workflows).
+        #[arg(long, default_value_t = true)]
+        json: bool,
+
+        #[arg(long)]
+        only_lang: Option<String>,
+
+        #[arg(long = "exclude", value_name = "PATTERN")]
+        exclude: Vec<String>,
+
+        #[arg(long)]
+        no_gitignore: bool,
+
         #[arg(long)]
         no_default_excludes: bool,
     },
@@ -192,6 +287,101 @@ fn main() -> Result<()> {
                     eprintln!("HTML report: {}", path.display());
                 }
             }
+            Ok(())
+        }
+        Command::Index {
+            dir,
+            out,
+            blind,
+            granularity,
+            k,
+            window,
+            only_lang,
+            exclude,
+            no_gitignore,
+            no_default_excludes,
+        } => {
+            let opts = ScanOptions {
+                blind: blind.into(),
+                granularity: granularity.into(),
+                k,
+                window,
+                only_lang,
+                walk: WalkOptions {
+                    respect_gitignore: !no_gitignore,
+                    apply_default_excludes: !no_default_excludes,
+                    custom_excludes: exclude,
+                },
+                ..ScanOptions::default()
+            };
+            let start = std::time::Instant::now();
+            let index = SearchIndex::build(&dir, &opts);
+            let elapsed = start.elapsed().as_secs_f32();
+            index.save(&out)?;
+            eprintln!(
+                "Indexed {} entries from {} in {:.2}s → {}",
+                index.entries.len(),
+                dir.display(),
+                elapsed,
+                out.display(),
+            );
+            Ok(())
+        }
+        Command::Search {
+            snippet,
+            keywords,
+            r#in,
+            index: index_path,
+            lang,
+            blind,
+            granularity,
+            k,
+            window,
+            min_jaccard,
+            top,
+            json: _,
+            only_lang,
+            exclude,
+            no_gitignore,
+            no_default_excludes,
+        } => {
+            let search_index = if let Some(idx_path) = index_path {
+                SearchIndex::load(&idx_path)?
+            } else {
+                let dir = r#in.as_ref().expect("--in is required when --index is not given");
+                let opts = ScanOptions {
+                    blind: blind.into(),
+                    granularity: granularity.into(),
+                    k,
+                    window,
+                    only_lang,
+                    walk: WalkOptions {
+                        respect_gitignore: !no_gitignore,
+                        apply_default_excludes: !no_default_excludes,
+                        custom_excludes: exclude,
+                    },
+                    ..ScanOptions::default()
+                };
+                SearchIndex::build(dir, &opts)
+            };
+
+            let result = if let Some(snippet_path) = snippet {
+                let snippet_text = if snippet_path == "-" {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    std::io::stdin().read_to_string(&mut buf)?;
+                    buf
+                } else {
+                    std::fs::read_to_string(&snippet_path)?
+                };
+                search_index.search_snippet(&snippet_text, lang.as_deref(), min_jaccard, top)
+            } else if let Some(kw) = keywords {
+                search_index.search_keywords(&kw, top)
+            } else {
+                anyhow::bail!("Either --snippet or --keywords is required");
+            };
+
+            println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
     }

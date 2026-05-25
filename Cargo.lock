@@ -1726,6 +1726,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap 4.6.1",
+ "serde_json",
  "tokei-dedup-classifier",
  "tokei-dedup-core",
  "tokei-dedup-engine",
@@ -1751,6 +1752,8 @@ version = "0.1.0"
 dependencies = [
  "ignore",
  "rayon",
+ "serde",
+ "serde_json",
  "tempdir",
  "tokei-dedup-classifier",
  "tokei-dedup-core",
@@ -1775,6 +1778,7 @@ dependencies = [
 name = "tokei-dedup-index"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "tokei-dedup-fingerprinter",
  "xxhash-rust",
 ]
