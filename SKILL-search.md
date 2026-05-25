@@ -39,7 +39,8 @@ dupe search --keywords "retry backoff" --index .dupe-index.json --json
 
 - **Snippet search** defaults are tuned for the common case:
   `--blind aggressive --granularity function --min-jaccard 0.3`
-- Lower `--min-jaccard` to 0.2 to cast a wider net (more noise).
+- Lower `--min-jaccard` to 0.2 to cast a wider net (recommended for
+  pre-duplication search — useful matches often score 0.25-0.4).
 - Raise to 0.5 for higher-confidence matches only.
 - Add `--lang Python` (or `Rust`, `JavaScript`, etc.) if the auto-detect
   guesses wrong.
